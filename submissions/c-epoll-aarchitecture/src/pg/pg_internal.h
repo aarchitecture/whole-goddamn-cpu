@@ -38,6 +38,15 @@ typedef enum pg_conn_role {
     PG_CONN_WRITE,
 } pg_conn_role;
 
+/* reconnect setup phases: dead conn, non-blocking connect, session init,
+ * prepared statements */
+typedef enum pg_setup {
+    PG_SETUP_NONE = 0,
+    PG_SETUP_CONNECT,
+    PG_SETUP_INIT,
+    PG_SETUP_PREPARE,
+} pg_setup;
+
 /* one execution of a single kind, detached from the queue while in flight */
 typedef struct pg_read_batch {
     pg_read_kind kind;
@@ -50,12 +59,16 @@ typedef struct pg_conn {
     pg_pool *pool;
     loop_fd *ev;
     pg_conn_role role;
+    int index;
     pg_pending *head;
     pg_pending *tail;
     int queued;                 // writes not yet delivered
     int64_t write_deadline_ms;  // idle write lane commits its queue then
     bool dead;
     bool busy;                  // one execution or pipeline group in flight
+    pg_setup setup;             // reconnect phase while dead
+    int64_t retry_at_ms;        // next reconnect attempt
+    int retry_backoff_ms;       // doubles on failure, capped, reset on success
 
     pg_read_batch batch;
 
@@ -81,6 +94,7 @@ struct pg_pool {
     int write_group;
     int write_window_ms;
     int rr;
+    char *url;
     pg_conn *conns;
 
     pg_read_queue queues[PG_READ_COUNT];
@@ -96,6 +110,7 @@ struct pg_pool {
 };
 
 void pg_conn_open(pg_conn *cn, const char *url, int index);
+void pg_conn_retry(pg_conn *cn);
 void pg_conn_pump(pg_conn *cn);
 void pg_conn_dispatch_read(pg_conn *cn);
 void pg_pool_dispatch_reads(pg_pool *pool);
@@ -103,6 +118,7 @@ void pg_pool_fail_queued_reads(pg_pool *pool);
 int  pg_read_batch_cap(const pg_pool *pool, pg_read_kind kind);
 void pg_pool_defer_failure(pg_pool *pool, pg_pending *head);
 void pg_pending_free(pg_pending *p);
+int64_t pg_mono_ms(void);
 
 /* stack-built around a PGresult, for one callback */
 struct pg_result {

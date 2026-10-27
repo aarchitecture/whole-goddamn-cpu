@@ -46,6 +46,9 @@
 #define PG_WRITE_WINDOW_MS          5       // let a lone write gather siblings
 #define PG_WRITE_IMMEDIATE          4       // a queue this deep commits now
 
+#define PG_RECONNECT_BACKOFF_MIN    100     // first retry after a lost conn
+#define PG_RECONNECT_BACKOFF_MAX    5000    // exponential retry cap
+
 #define CRYPTO_THREADS_DIV          1       // one bcrypt lane per core
 #define CRYPTO_THREADS_MIN          1
 

@@ -26,14 +26,12 @@ static const char *optional(const pg_result *res, int row, int col,
     return *is_null ? NULL : pg_result_value(res, row, col);
 }
 
-void user_view_load(user_view *v, const pg_result *res, int row,
-                    bool with_password) {
+void user_view_load(user_view *v, const pg_result *res, int row) {
     memset(v, 0, sizeof *v);
     v->username = pg_result_value(res, row, 1);
     v->email = pg_result_value(res, row, 2);
     v->bio = optional(res, row, 3, &v->bio_null);
     v->image = optional(res, row, 4, &v->image_null);
-    if (with_password) v->password_hash = pg_result_value(res, row, 5);
 }
 
 void profile_view_load(profile_view *v, const pg_result *res, int row) {

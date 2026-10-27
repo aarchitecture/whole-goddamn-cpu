@@ -14,7 +14,6 @@ typedef struct user_view {
     const char *email;
     const char *bio;
     const char *image;
-    const char *password_hash;
     bool bio_null;
     bool image_null;
 } user_view;
@@ -61,8 +60,7 @@ typedef struct comment_view {
     bool following;
 } comment_view;
 
-void user_view_load(user_view *v, const pg_result *res, int row,
-                    bool with_password);
+void user_view_load(user_view *v, const pg_result *res, int row);
 void profile_view_load(profile_view *v, const pg_result *res, int row);
 void article_view_load(article_view *v, const pg_result *res, int row,
                        bool full);

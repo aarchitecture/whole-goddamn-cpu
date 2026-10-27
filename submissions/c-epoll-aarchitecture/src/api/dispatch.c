@@ -15,21 +15,6 @@ static void run_handler(api_request *r) {
     r->route->handler(r);
 }
 
-static void auth_checked(void *ctx, pg_status status, const pg_result *res) {
-    api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
-
-    if (status == PG_ERROR) {
-        req_db_fail(r);
-        return;
-    }
-    if (pg_result_rows(res) < 1) {
-        req_fail(r, 401, "Unauthorized");
-        return;
-    }
-    run_handler(r);
-}
-
 static void authenticate(api_request *r) {
     switch (r->route->auth) {
     case AUTH_IGNORE:
@@ -61,9 +46,9 @@ static void authenticate(api_request *r) {
     }
     r->viewer = viewer;
 
-    const pg_read read = { .viewer = viewer };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_USER_ID, &read, r, auth_checked);
+    /* no user-existence probe: viewer-keyed statements return zero rows for a
+     * deleted user and the routes map that to 401 */
+    run_handler(r);
 }
 
 void api_begin(srv_conn *c, const http_request *rq, const char *body,

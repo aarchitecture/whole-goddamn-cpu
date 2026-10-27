@@ -1,6 +1,5 @@
 CC      ?= gcc
-# libpq headers are off the default path on Debian; fall back to pkg-config
-PGINC   := $(shell pkg-config --cflags libpq 2>/dev/null || echo -I/usr/include/postgresql)
+PGINC   := $(shell pkg-config --cflags libpq)
 WARN    := -std=c99 -Wall -Wextra -Werror -Wstrict-prototypes \
            -Wmissing-prototypes -Wshadow -Wformat=2 -Wvla
 CFLAGS  := $(WARN) -O2 -pthread -D_GNU_SOURCE -MMD -MP -Isrc $(PGINC)

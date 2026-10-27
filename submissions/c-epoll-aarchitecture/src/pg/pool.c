@@ -6,7 +6,7 @@
 #include "core/wake.h"
 #include "util.h"
 
-static int64_t mono_ms(void) {
+int64_t pg_mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -61,6 +61,8 @@ void pg_pool_open(pg_pool **out, const char *url, int read_conns,
 
     pg_pool *pool = xcalloc(1, sizeof *pool);
     pool->loop = l;
+    pool->url = xmalloc(strlen(url) + 1);
+    strcpy(pool->url, url);
     pool->read_conns = read_conns;
     pool->write_conns = write_conns;
     pool->read_live = read_conns;
@@ -83,6 +85,7 @@ void pg_pool_open(pg_pool **out, const char *url, int read_conns,
         cn->role = i < read_conns ? PG_CONN_READ : PG_CONN_WRITE;
         cn->group_results =
             xcalloc((size_t)write_group, sizeof *cn->group_results);
+        cn->retry_backoff_ms = PG_RECONNECT_BACKOFF_MIN;
         pg_conn_open(cn, url, i);
     }
     *out = pool;
@@ -162,7 +165,7 @@ void pg_submit(pg_pool *pool, pg_stmt stmt, int nparams,
         cn->write_deadline_ms = 0;
         pg_conn_pump(cn);
     } else if (cn->write_deadline_ms == 0) {
-        cn->write_deadline_ms = mono_ms() + pool->write_window_ms;
+        cn->write_deadline_ms = pg_mono_ms() + pool->write_window_ms;
     }
 }
 
@@ -194,7 +197,7 @@ void pg_read_submit(pg_pool *pool, pg_read_kind kind, const pg_read *read,
     read_push(&pool->queues[kind], p);
     pool->queued_reads++;
     if (pool->read_deadline_ms == 0)
-        pool->read_deadline_ms = mono_ms() + pool->read_window_ms;
+        pool->read_deadline_ms = pg_mono_ms() + pool->read_window_ms;
     pg_pool_dispatch_reads(pool);
 }
 
@@ -204,7 +207,7 @@ void pg_pool_dispatch_reads(pg_pool *pool) {
         return;
     }
 
-    int64_t now = mono_ms();
+    int64_t now = pg_mono_ms();
     if (pool->read_deadline_ms == 0)
         pool->read_deadline_ms = now + pool->read_window_ms;
 
@@ -225,11 +228,19 @@ void pg_pool_dispatch_reads(pg_pool *pool) {
 }
 
 void pg_pool_tick(pg_pool *pool) {
+    /* lost conns reconnect with backoff before any dispatch */
+    int64_t now = pg_mono_ms();
+    int total = pool->read_conns + pool->write_conns;
+    for (int i = 0; i < total; i++) {
+        pg_conn *cn = &pool->conns[i];
+        if (!cn->dead || cn->setup != PG_SETUP_NONE) continue;
+        if (cn->retry_at_ms == 0 || now < cn->retry_at_ms) continue;
+        pg_conn_retry(cn);
+    }
+
     if (pool->queued_reads) pg_pool_dispatch_reads(pool);
 
     /* send a write queued behind a busy lane as soon as the lane frees */
-    int64_t now = mono_ms();
-    int total = pool->read_conns + pool->write_conns;
     for (int i = pool->read_conns; i < total; i++) {
         pg_conn *cn = &pool->conns[i];
         if (cn->dead || cn->busy) continue;

@@ -30,6 +30,12 @@ typedef struct login_state {
     const char *password;
     char *hash;
     long long user_id;
+    const char *username;
+    const char *profile_email;
+    const char *bio;
+    const char *image;
+    bool bio_null;
+    bool image_null;
     bool verified;
 } login_state;
 
@@ -64,7 +70,7 @@ static void respond_user(api_request *r, const pg_result *res,
         return;
     }
     user_view view;
-    user_view_load(&view, res, 0, false);
+    user_view_load(&view, res, 0);
     buf_clear(&r->out);
     render_user(&r->out, &view, token);
     req_respond(r, 200);
@@ -84,7 +90,7 @@ static void register_inserted(void *ctx, pg_status status,
             return;
         }
         user_view view;
-        user_view_load(&view, res, 0, false);
+        user_view_load(&view, res, 0);
         buf_clear(&r->out);
         render_user(&r->out, &view, token);
         req_respond(r, 201);
@@ -155,18 +161,6 @@ void handle_users_register(api_request *r) {
     crypto_submit(r->worker->id, register_hash, register_hashed, state);
 }
 
-static void login_loaded(void *ctx, pg_status status, const pg_result *res) {
-    login_state *state = ctx;
-    api_request *r = state->r;
-    if (!req_release(r) || r->dead) return;
-
-    if (status == PG_ROWS && pg_result_rows(res) >= 1) {
-        respond_user(r, res, state->user_id);
-        return;
-    }
-    req_db_fail(r);
-}
-
 static void login_verified(void *arg) {
     login_state *state = arg;
     api_request *r = state->r;
@@ -176,10 +170,24 @@ static void login_verified(void *arg) {
         req_fail(r, 401, "Unauthorized");
         return;
     }
-    const pg_read read = { .viewer = state->user_id };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_USER_ID, &read, state,
-                   login_loaded);
+    /* the email read already carried the whole user row; render from the arena
+     * copies instead of reading it again */
+    const char *token = mint_token(r, state->user_id);
+    if (!token) {
+        req_fail(r, 500, "crypto unavailable");
+        return;
+    }
+    user_view view;
+    memset(&view, 0, sizeof view);
+    view.username = state->username;
+    view.email = state->profile_email;
+    view.bio = state->bio;
+    view.image = state->image;
+    view.bio_null = state->bio_null;
+    view.image_null = state->image_null;
+    buf_clear(&r->out);
+    render_user(&r->out, &view, token);
+    req_respond(r, 200);
 }
 
 static void login_verify(void *arg) {
@@ -198,6 +206,14 @@ static void login_row(void *ctx, pg_status status, const pg_result *res) {
          * later, so hand it an arena copy */
         state->hash = req_str(r, pg_result_value(res, 0, 5));
         state->user_id = strtoll(pg_result_value(res, 0, 0), NULL, 10);
+        state->username = req_str(r, pg_result_value(res, 0, 1));
+        state->profile_email = req_str(r, pg_result_value(res, 0, 2));
+        state->bio_null = pg_result_is_null(res, 0, 3);
+        state->bio = state->bio_null ? NULL
+                                     : req_str(r, pg_result_value(res, 0, 3));
+        state->image_null = pg_result_is_null(res, 0, 4);
+        state->image =
+            state->image_null ? NULL : req_str(r, pg_result_value(res, 0, 4));
         req_hold(r);
         crypto_submit(r->worker->id, login_verify, login_verified, state);
         return;
@@ -248,7 +264,8 @@ static void user_loaded(void *ctx, pg_status status, const pg_result *res) {
         return;
     }
     if (status == PG_ROWS) {
-        req_fail(r, 404, "user not found");
+        /* both statements key on the viewer id: zero rows = deleted user */
+        req_fail(r, 401, "Unauthorized");
         return;
     }
     req_db_fail(r);

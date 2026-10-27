@@ -263,19 +263,20 @@ static void article_updated(void *ctx, pg_status status,
         req_fail(r, 404, "article not found");
         return;
     }
-    if (strtoll(pg_result_value(res, 0, 1), NULL, 10) != r->viewer) {
+    /* the UPDATE fired only for the author: a NULL RETURNING row means the
+     * viewer is not it. the row already carries the post-update columns */
+    if (pg_result_is_null(res, 0, 0)) {
         req_fail(r, 403, "not the article author");
         return;
     }
 
-    long long article_id = strtoll(pg_result_value(res, 0, 0), NULL, 10);
-    const pg_read read = {
-        .viewer = r->viewer,
-        .offset = article_id,
-    };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_ARTICLE_ID, &read, r,
-                   article_loaded);
+    article_view view;
+    article_view_load(&view, res, 0, true);
+    buf_clear(&r->out);
+    BUF_LIT(&r->out, "{\"article\":");
+    render_article(&r->out, &view);
+    buf_putc(&r->out, '}');
+    req_respond(r, 200);
 }
 
 static void article_deleted(void *ctx, pg_status status,

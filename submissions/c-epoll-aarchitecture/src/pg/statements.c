@@ -19,10 +19,12 @@
 /* count via PK probe, not a per-request EXISTS */
 #define FAV_COUNT \
     "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count"
-#define FAVORITED \
-    "(SELECT true FROM favorites f WHERE f.user_id = r.v AND f.article_id = a.id) IS NOT NULL AS favorited"
-#define FOLLOWING \
-    "(SELECT true FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = a.author_id) IS NOT NULL AS following"
+#define FAVORITED_BY(v) \
+    "(SELECT true FROM favorites f WHERE f.user_id = " v " AND f.article_id = a.id) IS NOT NULL AS favorited"
+#define FOLLOWING_BY(v) \
+    "(SELECT true FROM follows fo WHERE fo.follower_id = " v " AND fo.followee_id = a.author_id) IS NOT NULL AS following"
+#define FAVORITED FAVORITED_BY("r.v")
+#define FOLLOWING FOLLOWING_BY("r.v")
 
 /* list decoration minus viewer flags, once per distinct article */
 #define LIST_ENRICH \
@@ -203,7 +205,8 @@ const char *const PG_STMT_SQL[PG_STMT_COUNT] = {
         "  FROM a JOIN users u ON u.id = a.author_id\n",
 
     /* $1 viewer, $2 slug, $3 title, $4 desc, $5 body (NULL = unchanged);
-     * returns id + author_id, only the author's UPDATE fires */
+     * RETURNING carries the new row so the response needs no read-back; w is
+     * empty when the viewer is not the author (handler answers 403) */
     [PG_STMT_ARTICLE_UPDATE] =
         "WITH t AS (SELECT id, author_id FROM articles WHERE slug = $2),\n"
         "     w AS (UPDATE articles a SET title = COALESCE($3, a.title),\n"
@@ -212,8 +215,17 @@ const char *const PG_STMT_SQL[PG_STMT_COUNT] = {
         "                 slug = CASE WHEN $3::text IS NULL THEN a.slug\n"
         "                             ELSE " SLUGIFY("$3") " || '-' || a.id END,\n"
         "                 updated_at = now()\n"
-        "           FROM t WHERE a.id = t.id AND t.author_id = $1)\n"
-        "SELECT t.id, t.author_id FROM t\n",
+        "           FROM t WHERE a.id = t.id AND t.author_id = $1\n"
+        "           RETURNING a.id, a.slug, a.title, a.description, a.body,\n"
+        "                     a.created_at, a.updated_at)\n"
+        "SELECT w.id, w.slug, w.title, w.description, w.body,\n"
+        "       " TS("w.created_at") ", " TS("w.updated_at") ",\n"
+        "       " TAG_NAMES ", " FAV_COUNT ", " FAVORITED_BY("$1") ",\n"
+        "       u.username, u.bio, u.image, " FOLLOWING_BY("$1") "\n"
+        "  FROM t\n"
+        "  JOIN articles a ON a.id = t.id\n"
+        "  JOIN users u ON u.id = a.author_id\n"
+        "  LEFT JOIN w ON true\n",
 
     [PG_STMT_ARTICLE_DELETE] =
         "WITH t AS (SELECT id, author_id FROM articles WHERE slug = $2),\n"
@@ -221,17 +233,44 @@ const char *const PG_STMT_SQL[PG_STMT_COUNT] = {
         "           WHERE a.id = t.id AND t.author_id = $1)\n"
         "SELECT t.author_id FROM t\n",
 
+    /* favorite writes return the full article: the count is the pre-write
+     * snapshot plus/minus the row this statement actually inserted/deleted
+     * (same-snapshot CTEs cannot see the write), favorited is literal */
     [PG_STMT_FAVORITES_INSERT] =
         "WITH t AS (SELECT id FROM articles WHERE slug = $2),\n"
+        "     n AS (SELECT count(*) AS c FROM favorites f\n"
+        "           WHERE f.article_id = (SELECT id FROM t)),\n"
         "     w AS (INSERT INTO favorites (user_id, article_id)\n"
-        "           SELECT $1, t.id FROM t ON CONFLICT DO NOTHING)\n"
-        "SELECT t.id FROM t\n",
+        "           SELECT $1, t.id FROM t ON CONFLICT DO NOTHING\n"
+        "           RETURNING article_id)\n"
+        "SELECT a.id, a.slug, a.title, a.description, a.body,\n"
+        "       " TS("a.created_at") ", " TS("a.updated_at") ",\n"
+        "       " TAG_NAMES ",\n"
+        "       n.c + (SELECT count(*) FROM w) AS favorites_count,\n"
+        "       true AS favorited,\n"
+        "       u.username, u.bio, u.image, " FOLLOWING_BY("$1") "\n"
+        "  FROM t\n"
+        "  JOIN articles a ON a.id = t.id\n"
+        "  JOIN users u ON u.id = a.author_id\n"
+        "  CROSS JOIN n\n",
 
     [PG_STMT_FAVORITES_DELETE] =
         "WITH t AS (SELECT id FROM articles WHERE slug = $2),\n"
+        "     n AS (SELECT count(*) AS c FROM favorites f\n"
+        "           WHERE f.article_id = (SELECT id FROM t)),\n"
         "     w AS (DELETE FROM favorites f USING t\n"
-        "           WHERE f.user_id = $1 AND f.article_id = t.id)\n"
-        "SELECT t.id FROM t\n",
+        "           WHERE f.user_id = $1 AND f.article_id = t.id\n"
+        "           RETURNING f.article_id)\n"
+        "SELECT a.id, a.slug, a.title, a.description, a.body,\n"
+        "       " TS("a.created_at") ", " TS("a.updated_at") ",\n"
+        "       " TAG_NAMES ",\n"
+        "       n.c - (SELECT count(*) FROM w) AS favorites_count,\n"
+        "       false AS favorited,\n"
+        "       u.username, u.bio, u.image, " FOLLOWING_BY("$1") "\n"
+        "  FROM t\n"
+        "  JOIN articles a ON a.id = t.id\n"
+        "  JOIN users u ON u.id = a.author_id\n"
+        "  CROSS JOIN n\n",
 
     /* $1 viewer, $2 slug, $3 body; article lookup + insert in one statement */
     [PG_STMT_COMMENTS_INSERT] =
@@ -285,13 +324,6 @@ const char *const PG_READ_SQL[PG_READ_COUNT] = {
         "    WHERE a.slug = r.k) x\n"
         "  ORDER BY r.i\n",
 
-    [PG_READ_ARTICLE_ID] =
-        "SELECT r.i, x.* FROM " U "\n"
-        "  CROSS JOIN LATERAL (SELECT " FULL_COLS "\n"
-        "    FROM articles a JOIN users u ON u.id = a.author_id\n"
-        "    WHERE a.id = r.o) x\n"
-        "  ORDER BY r.i\n",
-
     /* no row = no article; one NULL-id row = article w/o comments. viewer's
      * followees read once per request */
     [PG_READ_COMMENTS] =
@@ -343,7 +375,6 @@ const char *const PG_READ_SQL[PG_READ_COUNT] = {
 const unsigned char PG_READ_PARAM_COUNT[PG_READ_COUNT] = {
     [PG_READ_TAGS] = 0,
     [PG_READ_ARTICLE_SLUG] = 5,
-    [PG_READ_ARTICLE_ID] = 5,
     [PG_READ_COMMENTS] = 5,
     [PG_READ_PROFILE] = 5,
     [PG_READ_USER_ID] = 5,

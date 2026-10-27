@@ -22,7 +22,6 @@ typedef enum {
 typedef enum {
     PG_READ_TAGS = 0,
     PG_READ_ARTICLE_SLUG,
-    PG_READ_ARTICLE_ID,
     PG_READ_COMMENTS,
     PG_READ_PROFILE,
     PG_READ_USER_ID,

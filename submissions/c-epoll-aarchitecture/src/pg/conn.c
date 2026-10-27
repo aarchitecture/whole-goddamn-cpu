@@ -14,6 +14,9 @@ static void pg_conn_consume(pg_conn *cn);
 static void pg_conn_deliver_group(pg_conn *cn);
 static void pg_conn_deliver_one(pg_conn *cn, PGresult *r);
 static void pg_conn_deliver_read(pg_conn *cn, PGresult *r);
+static void setup_fail(pg_conn *cn, const char *what);
+static void setup_connected(pg_conn *cn);
+static void setup_poll(pg_conn *cn);
 
 static pg_status status_of(PGresult *r) {
     if (!r) return PG_ERROR;
@@ -226,6 +229,7 @@ void pg_conn_dispatch_read(pg_conn *cn) {
 }
 
 void pg_conn_open(pg_conn *cn, const char *url, int index) {
+    cn->index = index;
     cn->raw = PQconnectdb(url);
     CHECK(cn->raw != NULL, "pg[%d]: PQconnectdb failed", index);
     CHECK(PQstatus(cn->raw) == CONNECTION_OK, "pg[%d]: %s", index,
@@ -284,6 +288,13 @@ static void pg_conn_fail(pg_conn *cn) {
     if (cn->dead) return;
     cn->dead = true;
     pg_pool *pool = cn->pool;
+    int delay = cn->retry_backoff_ms;
+    cn->retry_at_ms = pg_mono_ms() + delay;
+    cn->retry_backoff_ms = delay * 2 > PG_RECONNECT_BACKOFF_MAX
+                               ? PG_RECONNECT_BACKOFF_MAX
+                               : delay * 2;
+    fprintf(stderr, "pg[%d]: connection lost; retry in %d ms\n", cn->index,
+            delay);
     if (cn->role == PG_CONN_READ) {
         CHECK(pool->read_live > 0, "pg: read live count underflow");
         pool->read_live--;
@@ -552,9 +563,207 @@ static void pg_conn_consume(pg_conn *cn) {
     else pg_conn_consume_write(cn);
 }
 
+/* ---- reconnect: dead conns come back via pool tick + the conn's own fd ---- */
+
+/* non-blocking setup, one phase per result drain: TCP connect poll, session
+ * SETs, then every PQprepare pipelined into a single round trip */
+static void setup_events(pg_conn *cn, unsigned events) {
+    if (cn->ev) loop_set_events(cn->pool->loop, cn->ev, events);
+}
+
+static void setup_send_prepares(pg_conn *cn) {
+    if (PQenterPipelineMode(cn->raw) != 1) {
+        setup_fail(cn, "enter pipeline");
+        return;
+    }
+    for (int i = 0; i < PG_STMT_COUNT; i++) {
+        char name[16];
+        int n = snprintf(name, sizeof name, "s%d", i);
+        CHECK(n > 0 && (size_t)n < sizeof name, "pg[%d]: statement name",
+              cn->index);
+        if (PQsendPrepare(cn->raw, name, PG_STMT_SQL[i],
+                          (int)PG_STMT_PARAM_COUNT[i], NULL) != 1) {
+            setup_fail(cn, "prepare send");
+            return;
+        }
+    }
+    for (int i = 0; i < PG_READ_COUNT; i++) {
+        char name[16];
+        int n = snprintf(name, sizeof name, "r%d", i);
+        CHECK(n > 0 && (size_t)n < sizeof name, "pg[%d]: read name", cn->index);
+        if (PQsendPrepare(cn->raw, name, PG_READ_SQL[i],
+                          (int)PG_READ_PARAM_COUNT[i], NULL) != 1) {
+            setup_fail(cn, "prepare send");
+            return;
+        }
+    }
+    if (PQpipelineSync(cn->raw) != 1) {
+        setup_fail(cn, "pipeline sync");
+        return;
+    }
+    cn->setup = PG_SETUP_PREPARE;
+}
+
+static void setup_fail(pg_conn *cn, const char *what) {
+    if (cn->ev) {
+        loop_remove(cn->pool->loop, cn->ev);
+        cn->ev = NULL;
+    }
+    if (cn->raw) {
+        fprintf(stderr, "pg[%d]: reconnect %s failed: %s", cn->index, what,
+                PQerrorMessage(cn->raw));
+        PQfinish(cn->raw);
+        cn->raw = NULL;
+    }
+    cn->busy = false;
+    group_clear(cn);
+    cn->setup = PG_SETUP_NONE;
+    int delay = cn->retry_backoff_ms;
+    cn->retry_at_ms = pg_mono_ms() + delay;
+    cn->retry_backoff_ms = delay * 2 > PG_RECONNECT_BACKOFF_MAX
+                               ? PG_RECONNECT_BACKOFF_MAX
+                               : delay * 2;
+    fprintf(stderr, "pg[%d]: next retry in %d ms\n", cn->index, delay);
+}
+
+static void setup_ready(pg_conn *cn) {
+    if (PQexitPipelineMode(cn->raw) != 1) {
+        setup_fail(cn, "exit pipeline");
+        return;
+    }
+    while (!PQisBusy(cn->raw)) {
+        PGresult *left = PQgetResult(cn->raw);
+        if (!left) break;
+        PQclear(left);
+    }
+
+    pg_pool *pool = cn->pool;
+    cn->setup = PG_SETUP_NONE;
+    cn->dead = false;
+    cn->busy = false;
+    cn->retry_at_ms = 0;
+    cn->retry_backoff_ms = PG_RECONNECT_BACKOFF_MIN;
+    setup_events(cn, LOOP_IN);
+    fprintf(stderr, "pg[%d]: reconnected\n", cn->index);
+
+    if (cn->role == PG_CONN_READ) {
+        pool->read_live++;
+        pg_pool_dispatch_reads(pool);
+    } else {
+        pool->write_live++;
+    }
+}
+
+static void setup_consume(pg_conn *cn) {
+    if (!PQconsumeInput(cn->raw)) {
+        setup_fail(cn, "setup input");
+        return;
+    }
+    for (;;) {
+        if (PQisBusy(cn->raw)) break;
+        PGresult *r = PQgetResult(cn->raw);
+        if (!r) {
+            if (cn->setup == PG_SETUP_INIT) {
+                setup_send_prepares(cn);
+                return;
+            }
+            continue;           // pipeline separators between prepares
+        }
+        ExecStatusType st = PQresultStatus(r);
+        if (st == PGRES_PIPELINE_SYNC) {
+            PQclear(r);
+            setup_ready(cn);
+            return;
+        }
+        if (st != PGRES_COMMAND_OK) {
+            fprintf(stderr, "pg[%d]: setup: %s", cn->index,
+                    PQresultErrorMessage(r));
+            PQclear(r);
+            setup_fail(cn, "setup statement");
+            return;
+        }
+        PQclear(r);
+    }
+    setup_events(cn, LOOP_IN);
+}
+
+static void setup_poll(pg_conn *cn) {
+    PostgresPollingStatusType ps = PQconnectPoll(cn->raw);
+    switch (ps) {
+    case PGRES_POLLING_OK:
+        setup_connected(cn);
+        return;
+    case PGRES_POLLING_FAILED:
+        setup_fail(cn, "connect");
+        return;
+    case PGRES_POLLING_READING:
+        setup_events(cn, LOOP_IN);
+        return;
+    case PGRES_POLLING_WRITING:
+        setup_events(cn, LOOP_OUT);
+        return;
+    default:
+        return;
+    }
+}
+
+static void setup_connected(pg_conn *cn) {
+    if (PQsetnonblocking(cn->raw, 1) != 0) {
+        setup_fail(cn, "setnonblocking");
+        return;
+    }
+    if (!PQsendQuery(cn->raw, PG_SESSION_INIT)) {
+        setup_fail(cn, "session init send");
+        return;
+    }
+    cn->setup = PG_SETUP_INIT;
+    setup_events(cn, LOOP_IN);
+}
+
+void pg_conn_retry(pg_conn *cn) {
+    if (!cn->dead || cn->setup != PG_SETUP_NONE) return;
+
+    cn->setup = PG_SETUP_CONNECT;
+    cn->raw = PQconnectStart(cn->pool->url);
+    if (!cn->raw || PQstatus(cn->raw) == CONNECTION_BAD) {
+        setup_fail(cn, "connect start");
+        return;
+    }
+    int fd = PQsocket(cn->raw);
+    if (fd < 0) {
+        setup_fail(cn, "connect socket");
+        return;
+    }
+    cn->ev = loop_add(cn->pool->loop, fd, LOOP_IN, pg_conn_event, cn);
+    if (!cn->ev) {
+        setup_fail(cn, "loop_add");
+        return;
+    }
+    setup_poll(cn);
+}
+
+static void setup_event(pg_conn *cn, unsigned events) {
+    if (events & LOOP_ERR) {
+        setup_fail(cn, cn->setup == PG_SETUP_CONNECT ? "connect socket"
+                                                     : "setup socket");
+        return;
+    }
+    if (cn->setup == PG_SETUP_CONNECT) {
+        setup_poll(cn);
+        return;
+    }
+    setup_consume(cn);
+}
+
 static void pg_conn_event(void *user, loop_fd *self, unsigned events) {
     (void)self;
     pg_conn *cn = user;
+
+    /* reconnect phases drive the fd until the conn is live again */
+    if (cn->setup != PG_SETUP_NONE) {
+        setup_event(cn, events);
+        return;
+    }
     if (cn->dead) return;
 
     if (events & LOOP_ERR) {
