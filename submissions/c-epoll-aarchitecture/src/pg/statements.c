@@ -1,12 +1,22 @@
 #include "pg/statements.h"
 
-/* timestamps formatted in SQL: the suite compares 3 fractional digits */
-#define TS_FMT "'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'"
-#define TS(col) "to_char(" col " AT TIME ZONE 'UTC', " TS_FMT ")"
+/* timestamps as epoch microseconds (int8): to_char per row is expensive and
+ * the C side formats. exact decomposition: days via date difference plus the
+ * within-day interval's components -- extract(epoch) is double and lossy at
+ * microsecond precision, extract(second) is numeric and exact */
+#define TS(col) \
+    "(((" col " AT TIME ZONE 'UTC')::date - DATE '1970-01-01') * 86400000000::bigint" \
+    " + (extract(hour from (" col " AT TIME ZONE 'UTC') - date_trunc('day', " col " AT TIME ZONE 'UTC')) * 3600000000" \
+    " + extract(minute from (" col " AT TIME ZONE 'UTC') - date_trunc('day', " col " AT TIME ZONE 'UTC')) * 60000000" \
+    " + extract(second from (" col " AT TIME ZONE 'UTC') - date_trunc('day', " col " AT TIME ZONE 'UTC')) * 1000000)::bigint)"
 
 /* request row for batched reads: i routes rows back; v/l/o/k =
  * viewer/limit/offset/key */
 #define U "unnest($1::int4[], $2::int8[], $3::int4[], $4::int8[], $5::text[]) AS r(i, v, l, o, k)"
+
+/* the merged list statement's request rows add the kind branch */
+#define U6 \
+    "unnest($1::int4[], $2::int8[], $3::int4[], $4::int8[], $5::text[], $6::int4[]) AS r(i, v, l, o, k, t)"
 
 #define SLUGIFY(x) "trim(both '-' from lower(regexp_replace(" x ", '[^A-Za-z0-9]+', '-', 'g')))"
 
@@ -31,13 +41,6 @@
     "a.id, a.author_id, a.slug, a.title, a.description, " \
     TS("a.created_at") " AS created_at, " TS("a.updated_at") " AS updated_at, " \
     TAG_NAMES ", " FAV_COUNT ", u.username, u.bio, u.image"
-
-#define FOLLOWING_PAGE \
-    "(SELECT true FROM follows fo WHERE fo.follower_id = p.viewer\n" \
-    "   AND fo.followee_id = ax.author_id) IS NOT NULL AS following"
-/* feed rows already come from the viewer's follows: following is constant
- * true */
-#define FOLLOWING_TRUE "true AS following"
 
 /* full article cols 0..13: list prefix + body at 4 */
 #define FULL_COLS \
@@ -66,21 +69,99 @@
     "(SELECT count(*) FROM (SELECT 1 FROM favorites c\n" \
     "   WHERE c.user_id = (SELECT u.id FROM users u WHERE u.username = r.k)\n" \
     "   LIMIT 1000) s)"
-#define COUNT_FEED \
-    "(SELECT count(*) FROM (SELECT 1 FROM articles c\n" \
-    "   WHERE c.author_id = ANY (ARRAY(SELECT fo.followee_id FROM follows fo\n" \
-    "                                  WHERE fo.follower_id = r.v))\n" \
-    "   LIMIT 1000) s)"
 
-/* page ids cut before decoration; articles enriched once per distinct id,
- * counts once per key; viewer flags per request row */
-#define LIST_QUERY(key, count, ids, following) \
-    "WITH req AS (SELECT * FROM " U "),\n" \
-    "     cnt AS MATERIALIZED (SELECT r." key " AS key, " count " AS n\n" \
-    "                            FROM (SELECT DISTINCT " key " FROM req) r),\n" \
+/* ONE statement for every list-shaped read: all/tag/author/favorited/feed
+ * branch per request on r.t. pages cut ids per kind (a kind absent from the
+ * batch costs nothing); ONE artx enrichment covers the union of all kinds'
+ * ids -- the cross-endpoint dedup; counts once per (kind, key); feed counts
+ * once per viewer. feed following is constant true */
+#define LIST_ONE \
+    "WITH req AS (SELECT * FROM " U6 "),\n" \
+    "     reqs AS MATERIALIZED (\n" \
+    "       SELECT r.i, r.v, r.l, r.o, COALESCE(r.k, '') AS key, r.t,\n" \
+    "              GREATEST(r.l + r.o, 1) AS depth\n" \
+    "       FROM req r),\n" \
+    "     pages0 AS MATERIALIZED (\n" \
+    "       SELECT r.i, r.v AS viewer, 0 AS t, ''::text AS key, p.id\n" \
+    "         FROM (SELECT * FROM req WHERE t = 0) r\n" \
+    "         LEFT JOIN (SELECT k.l, k.o, x.id\n" \
+    "                      FROM (SELECT DISTINCT l, o FROM req WHERE t = 0) k\n" \
+    "                      CROSS JOIN LATERAL (SELECT a.id FROM articles a\n" \
+    "                        ORDER BY a.id DESC LIMIT k.l OFFSET k.o) x) p\n" \
+    "           ON p.l = r.l AND p.o = r.o),\n" \
+    "     pages1 AS MATERIALIZED (\n" \
+    "       SELECT r.i, r.v AS viewer, 1 AS t, r.key, x.id\n" \
+    "         FROM (SELECT * FROM reqs WHERE t = 1) r\n" \
+    "         LEFT JOIN LATERAL (SELECT at.article_id AS id FROM article_tags at\n" \
+    "           WHERE at.tag_id = (SELECT tu.id FROM tags tu WHERE tu.name = r.key)\n" \
+    "           ORDER BY at.article_id DESC LIMIT r.l OFFSET r.o) x ON true),\n" \
+    "     pages2 AS MATERIALIZED (\n" \
+    "       SELECT r.i, r.v AS viewer, 2 AS t, r.key, x.id\n" \
+    "         FROM (SELECT * FROM reqs WHERE t = 2) r\n" \
+    "         LEFT JOIN LATERAL (SELECT a.id FROM articles a\n" \
+    "           WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = r.key)\n" \
+    "           ORDER BY a.id DESC LIMIT r.l OFFSET r.o) x ON true),\n" \
+    "     pages3 AS MATERIALIZED (\n" \
+    "       SELECT r.i, r.v AS viewer, 3 AS t, r.key, x.id\n" \
+    "         FROM (SELECT * FROM reqs WHERE t = 3) r\n" \
+    "         LEFT JOIN LATERAL (SELECT f.article_id AS id FROM favorites f\n" \
+    "           WHERE f.user_id = (SELECT fu2.id FROM users fu2 WHERE fu2.username = r.key)\n" \
+    "           ORDER BY f.article_id DESC LIMIT r.l OFFSET r.o) x ON true),\n" \
+    "     fu AS MATERIALIZED (\n" \
+    "       SELECT r.v,\n" \
+    "              ARRAY(SELECT fo.followee_id FROM follows fo\n" \
+    "                     WHERE fo.follower_id = r.v) AS fids,\n" \
+    "              COALESCE((SELECT max(q.depth) FROM reqs q\n" \
+    "                         WHERE q.v = r.v AND q.t = 4), 1) AS depth\n" \
+    "       FROM (SELECT DISTINCT v FROM req WHERE t = 4) r),\n" \
+    "     hubs AS MATERIALIZED (\n" \
+    "       SELECT h.fid,\n" \
+    "              EXISTS (SELECT 1 FROM articles a\n" \
+    "                       WHERE a.author_id = h.fid\n" \
+    "                       ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS capped,\n" \
+    "              (SELECT a.id FROM articles a\n" \
+    "                WHERE a.author_id = h.fid\n" \
+    "                ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id\n" \
+    "       FROM (SELECT f.fid, max(fu.depth) AS depth\n" \
+    "               FROM fu, unnest(fu.fids) AS f(fid)\n" \
+    "              GROUP BY f.fid HAVING count(*) >= 2\n" \
+    "              ORDER BY count(*) DESC, f.fid LIMIT 16) h),\n" \
+    "     capped_fids AS MATERIALIZED (\n" \
+    "       SELECT ARRAY(SELECT fid FROM hubs WHERE capped) AS fids),\n" \
+    "     cnt4 AS MATERIALIZED (\n" \
+    "       SELECT fu.v AS vkey,\n" \
+    "              CASE WHEN fu.fids && (SELECT fids FROM capped_fids)\n" \
+    "                        THEN 1000::bigint\n" \
+    "                   ELSE (SELECT count(*) FROM (SELECT 1 FROM articles c\n" \
+    "                          WHERE c.author_id = ANY(fu.fids)\n" \
+    "                          LIMIT 1000) s) END AS n\n" \
+    "       FROM fu),\n" \
+    "     cntl AS MATERIALIZED (\n" \
+    "       SELECT r.t, r.k, CASE r.t\n" \
+    "         WHEN 0 THEN " COUNT_ALL "\n" \
+    "         WHEN 1 THEN " COUNT_TAG "\n" \
+    "         WHEN 2 THEN " COUNT_AUTHOR "\n" \
+    "         WHEN 3 THEN " COUNT_FAVORITED "\n" \
+    "       END AS n\n" \
+    "       FROM (SELECT DISTINCT t, key AS k FROM reqs WHERE t < 4) r),\n" \
+    "     pages4 AS MATERIALIZED (\n" \
+    "       SELECT r.i, r.v AS viewer, 4 AS t, r.v::text AS key, x.id\n" \
+    "         FROM (SELECT * FROM reqs WHERE t = 4) r\n" \
+    "         JOIN fu ON fu.v = r.v\n" \
+    "         CROSS JOIN LATERAL (SELECT max(h.floor_id) AS floor_id\n" \
+    "                               FROM hubs h\n" \
+    "                              WHERE h.fid = ANY(fu.fids)) fl\n" \
+    "         LEFT JOIN LATERAL (\n" \
+    "           SELECT y.id FROM unnest(fu.fids) AS fid\n" \
+    "           CROSS JOIN LATERAL (SELECT a2.id FROM articles a2\n" \
+    "             WHERE a2.author_id = fid\n" \
+    "               AND a2.id >= COALESCE(fl.floor_id, 0::bigint)\n" \
+    "             ORDER BY a2.id DESC LIMIT GREATEST(r.l + r.o, 1)) y\n" \
+    "           ORDER BY y.id DESC LIMIT r.l OFFSET r.o) x ON true),\n" \
     "     pages AS MATERIALIZED (\n" \
-    "       SELECT r.i, r.v AS viewer, r." key " AS key, x.id\n" \
-    "       FROM req r LEFT JOIN LATERAL (" ids ") x ON true),\n" \
+    "       SELECT * FROM pages0 UNION ALL SELECT * FROM pages1\n" \
+    "       UNION ALL SELECT * FROM pages2 UNION ALL SELECT * FROM pages3\n" \
+    "       UNION ALL SELECT * FROM pages4),\n" \
     "     artx AS MATERIALIZED (SELECT " LIST_ENRICH "\n" \
     "       FROM (SELECT DISTINCT id FROM pages WHERE id IS NOT NULL) ar\n" \
     "       CROSS JOIN LATERAL (SELECT x.* FROM articles x\n" \
@@ -89,66 +170,26 @@
     "         WHERE x.id = a.author_id LIMIT 1) u)\n" \
     "SELECT p.i, ax.id, ax.slug, ax.title, ax.description,\n" \
     "       ax.created_at, ax.updated_at, ax.tag_list, ax.favorites_count,\n" \
-    "       (SELECT true FROM favorites f WHERE f.user_id = p.viewer\n" \
-    "         AND f.article_id = p.id) IS NOT NULL AS favorited,\n" \
+    "       CASE WHEN p.t = 4 THEN true\n" \
+    "            ELSE (SELECT true FROM favorites f WHERE f.user_id = p.viewer\n" \
+    "                  AND f.article_id = p.id) IS NOT NULL END AS favorited,\n" \
     "       ax.username, ax.bio, ax.image,\n" \
-    "       " following ",\n" \
+    "       CASE WHEN p.t = 4 THEN true\n" \
+    "            ELSE (SELECT true FROM follows fo WHERE fo.follower_id = p.viewer\n" \
+    "                  AND fo.followee_id = ax.author_id) IS NOT NULL END AS following,\n" \
     "       c.n AS articles_count\n" \
-    "  FROM pages p JOIN cnt c ON c.key = p.key\n" \
+    "  FROM pages p\n" \
+    "  LEFT JOIN (SELECT 4 AS t, vkey::text AS key, n FROM cnt4\n" \
+    "             UNION ALL SELECT t, k, n FROM cntl) c\n" \
+    "    ON c.t = p.t AND c.key = p.key\n" \
     "  LEFT JOIN artx ax ON ax.id = p.id\n" \
     "  ORDER BY p.i, p.id DESC"
 
-/* unfiltered list is the hot page: many viewers ask for the same page in one
- * batch, so page selection, tags, counts, timestamps + author rows are computed
- * once per distinct article; viewer checks stay per row */
-#define LIST_ALL \
-    "WITH req AS (SELECT * FROM " U "),\n" \
-    "     cnt AS MATERIALIZED (SELECT " COUNT_ALL " AS n),\n" \
-    "     pages AS MATERIALIZED (\n" \
-    "       SELECT k.l, k.o, x.id FROM (SELECT DISTINCT l, o FROM req) k\n" \
-    "       CROSS JOIN LATERAL (SELECT a.id FROM articles a\n" \
-    "         ORDER BY a.id DESC LIMIT k.l OFFSET k.o) x),\n" \
-    "     arts AS (SELECT DISTINCT id FROM pages),\n" \
-    "     artx AS MATERIALIZED (SELECT " LIST_ENRICH "\n" \
-    "       FROM arts ar\n" \
-    "       CROSS JOIN LATERAL (SELECT x.* FROM articles x\n" \
-    "         WHERE x.id = ar.id LIMIT 1) a\n" \
-    "       CROSS JOIN LATERAL (SELECT x.username, x.bio, x.image FROM users x\n" \
-    "         WHERE x.id = a.author_id LIMIT 1) u),\n" \
-    "     req_page AS (\n" \
-    "       SELECT r.i, r.v, p.id FROM req r\n" \
-    "       LEFT JOIN pages p ON p.l = r.l AND p.o = r.o)\n" \
-    "SELECT rp.i, ax.id, ax.slug, ax.title, ax.description,\n" \
-    "       ax.created_at, ax.updated_at, ax.tag_list, ax.favorites_count,\n" \
-    "       (SELECT true FROM favorites f WHERE f.user_id = rp.v\n" \
-    "         AND f.article_id = rp.id) IS NOT NULL AS favorited,\n" \
-    "       ax.username, ax.bio, ax.image,\n" \
-    "       (SELECT true FROM follows fo WHERE fo.follower_id = rp.v\n" \
-    "         AND fo.followee_id = ax.author_id) IS NOT NULL AS following,\n" \
-    "       c.n AS articles_count\n" \
-    "  FROM req_page rp JOIN cnt c ON true\n" \
-    "  LEFT JOIN artx ax ON ax.id = rp.id\n" \
-    "  ORDER BY rp.i, rp.id DESC"
-
-#define IDS_TAG \
-    "SELECT at.article_id AS id FROM article_tags at\n" \
-    "  WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.k)\n" \
-    "  ORDER BY at.article_id DESC LIMIT r.l OFFSET r.o"
-#define IDS_AUTHOR \
-    "SELECT x.id FROM articles x\n" \
-    "  WHERE x.author_id = (SELECT au.id FROM users au WHERE au.username = r.k)\n" \
-    "  ORDER BY x.id DESC LIMIT r.l OFFSET r.o"
-#define IDS_FAVORITED \
-    "SELECT f.article_id AS id FROM favorites f\n" \
-    "  WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = r.k)\n" \
-    "  ORDER BY f.article_id DESC LIMIT r.l OFFSET r.o"
-#define IDS_FEED \
-    "SELECT x.id FROM follows fo\n" \
-    "  CROSS JOIN LATERAL (SELECT a2.id FROM articles a2\n" \
-    "    WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC\n" \
-    "    LIMIT (r.l::bigint + r.o)) x\n" \
-    "  WHERE fo.follower_id = r.v ORDER BY x.id DESC LIMIT r.l OFFSET r.o"
-
+/* feed pages: a viewer can follow hundreds of authors, so expand every followee
+ * only under a floor. the top-16 followees shared by >=2 viewers in this batch
+ * bound the scan: the highest per-hub floor is already deeper than the whole
+ * page needs, so anything older cannot appear. counts keep the 1000 cap and
+ * short-circuit when a followed author alone is capped */
 const char *const PG_STMT_SQL[PG_STMT_COUNT] = {
     /* ON CONFLICT DO NOTHING: a duplicate registration must not abort the
      * write group */
@@ -364,12 +405,7 @@ const char *const PG_READ_SQL[PG_READ_COUNT] = {
         "    u.password_hash FROM users u WHERE u.email = r.k) x\n"
         "  ORDER BY r.i\n",
 
-    [PG_READ_LIST_ALL] = LIST_ALL,
-    [PG_READ_LIST_TAG] = LIST_QUERY("k", COUNT_TAG, IDS_TAG, FOLLOWING_PAGE),
-    [PG_READ_LIST_AUTHOR] = LIST_QUERY("k", COUNT_AUTHOR, IDS_AUTHOR, FOLLOWING_PAGE),
-    [PG_READ_LIST_FAVORITED] =
-        LIST_QUERY("k", COUNT_FAVORITED, IDS_FAVORITED, FOLLOWING_PAGE),
-    [PG_READ_FEED] = LIST_QUERY("v", COUNT_FEED, IDS_FEED, FOLLOWING_TRUE),
+    [PG_READ_LIST] = LIST_ONE,
 };
 
 const unsigned char PG_READ_PARAM_COUNT[PG_READ_COUNT] = {
@@ -379,11 +415,7 @@ const unsigned char PG_READ_PARAM_COUNT[PG_READ_COUNT] = {
     [PG_READ_PROFILE] = 5,
     [PG_READ_USER_ID] = 5,
     [PG_READ_USER_EMAIL] = 5,
-    [PG_READ_LIST_ALL] = 5,
-    [PG_READ_LIST_TAG] = 5,
-    [PG_READ_LIST_AUTHOR] = 5,
-    [PG_READ_LIST_FAVORITED] = 5,
-    [PG_READ_FEED] = 5,
+    [PG_READ_LIST] = 6,
 };
 
 /* session-only planner settings: generic plans skip replanning batched stmts;
@@ -391,4 +423,6 @@ const unsigned char PG_READ_PARAM_COUNT[PG_READ_COUNT] = {
  * cache another request's probes */
 const char *const PG_SESSION_INIT =
     "SET plan_cache_mode = force_generic_plan; SET jit = off; "
-    "SET max_parallel_workers_per_gather = 0; SET enable_memoize = off";
+    "SET max_parallel_workers_per_gather = 0; SET enable_memoize = off; "
+    "SET work_mem = '32MB'; SET random_page_cost = 1.1; "
+    "SET effective_io_concurrency = 200";

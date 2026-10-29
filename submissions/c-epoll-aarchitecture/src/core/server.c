@@ -27,7 +27,7 @@ void srv_worker_init(srv_worker *w, int id, const char *db_url, int read_conns,
     w->loop = loop_create();
 
     pg_pool_open(&w->pg, db_url, read_conns, write_conns, read_batch,
-                 read_window_ms, write_group, write_window_ms, w->loop);
+                 read_window_ms, write_group, write_window_ms, id, w->loop);
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof hints);

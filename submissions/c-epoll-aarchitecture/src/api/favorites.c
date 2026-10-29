@@ -9,7 +9,7 @@
 static void favorite_written(void *ctx, pg_status status,
                              const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ERROR) {
         req_db_fail(r);
@@ -30,10 +30,9 @@ static void favorite_written(void *ctx, pg_status status,
 
 static void favorite_begin(api_request *r, bool add) {
     const char *params[2] = { req_ll(r, r->viewer), r->seg[0] };
-    req_hold(r);
-    pg_submit(r->worker->pg,
-              add ? PG_STMT_FAVORITES_INSERT : PG_STMT_FAVORITES_DELETE,
-              2, params, r, favorite_written);
+    api_pg_write(r,
+                 add ? PG_STMT_FAVORITES_INSERT : PG_STMT_FAVORITES_DELETE,
+                 2, params, r, favorite_written);
 }
 
 void handle_favorite_add(api_request *r) {

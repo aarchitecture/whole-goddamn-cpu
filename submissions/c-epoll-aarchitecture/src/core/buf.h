@@ -26,10 +26,13 @@ void buf_putc(buf *b, char c);
 
 // printf into buf; vsnprintf's NUL stays in reserved cap, not counted in len
 void buf_printf(buf *b, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3), nonnull(2)));
+__attribute__((format(printf, 2, 3), nonnull(2)));
 
 // drop first n bytes (partial socket writes)
 void buf_consume(buf *b, size_t n);
+
+// append a decimal integer; hand-rolled, no printf machinery
+void buf_num(buf *b, long long v);
 
 #define BUF_LIT(b, lit) buf_append((b), (lit), sizeof(lit) - 1)
 

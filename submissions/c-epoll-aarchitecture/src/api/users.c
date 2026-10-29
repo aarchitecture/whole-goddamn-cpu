@@ -80,7 +80,7 @@ static void register_inserted(void *ctx, pg_status status,
                               const pg_result *res) {
     register_state *state = ctx;
     api_request *r = state->r;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ROWS && pg_result_rows(res) >= 1) {
         long long id = strtoll(pg_result_value(res, 0, 0), NULL, 10);
@@ -118,8 +118,7 @@ static void register_hashed(void *arg) {
     }
 
     const char *params[3] = { state->username, state->email, state->hash };
-    req_hold(r);
-    pg_submit(r->worker->pg, PG_STMT_USERS_INSERT, 3, params, state,
+    api_pg_write(r, PG_STMT_USERS_INSERT, 3, params, state,
               register_inserted);
 }
 
@@ -199,7 +198,7 @@ static void login_verify(void *arg) {
 static void login_row(void *ctx, pg_status status, const pg_result *res) {
     login_state *state = ctx;
     api_request *r = state->r;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ROWS && pg_result_rows(res) >= 1) {
         /* hash only valid until this callback returns; the worker thread runs
@@ -246,13 +245,12 @@ void handle_users_login(api_request *r) {
     state->password = password;
 
     const pg_read read = { .key = email };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_USER_EMAIL, &read, state, login_row);
+    api_pg_read(r, PG_READ_USER_EMAIL, &read, state, login_row);
 }
 
 static void user_loaded(void *ctx, pg_status status, const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ROWS && pg_result_rows(res) >= 1) {
         respond_user(r, res, 0);
@@ -273,8 +271,7 @@ static void user_loaded(void *ctx, pg_status status, const pg_result *res) {
 
 void handle_user_get(api_request *r) {
     const pg_read read = { .viewer = r->viewer };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_USER_ID, &read, r, user_loaded);
+    api_pg_read(r, PG_READ_USER_ID, &read, r, user_loaded);
 }
 
 static void update_hashed(void *arg) {
@@ -289,8 +286,7 @@ static void update_hashed(void *arg) {
     const char *params[6] = { req_ll(r, r->viewer), state->email,
                               state->username, state->hash, state->bio,
                               state->image };
-    req_hold(r);
-    pg_submit(r->worker->pg, PG_STMT_USERS_UPDATE, 6, params, r, user_loaded);
+    api_pg_write(r, PG_STMT_USERS_UPDATE, 6, params, r, user_loaded);
 }
 
 static void update_hash(void *arg) {
@@ -346,6 +342,5 @@ void handle_user_update(api_request *r) {
     const char *params[6] = { req_ll(r, r->viewer), state->email,
                               state->username, NULL, state->bio,
                               state->image };
-    req_hold(r);
-    pg_submit(r->worker->pg, PG_STMT_USERS_UPDATE, 6, params, r, user_loaded);
+    api_pg_write(r, PG_STMT_USERS_UPDATE, 6, params, r, user_loaded);
 }

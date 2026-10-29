@@ -33,8 +33,8 @@ typedef struct article_view {
     const char *description;
     const char *body;
     bool body_present;
-    const char *created_at;
-    const char *updated_at;
+    long long created_at;           // epoch micros (UTC)
+    long long updated_at;
     const char *tags;               // pg text[] literal
     bool tags_null;
     const char *favorites_count;
@@ -50,8 +50,8 @@ typedef struct article_view {
 typedef struct comment_view {
     long long id;
     const char *body;
-    const char *created_at;
-    const char *updated_at;
+    long long created_at;           // epoch micros (UTC)
+    long long updated_at;
     const char *author_username;
     const char *author_bio;
     const char *author_image;

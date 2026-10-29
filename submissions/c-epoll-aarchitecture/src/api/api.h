@@ -29,9 +29,11 @@ typedef struct api_request {
     const char *seg[API_MAX_CAPTURES];  // arena copies of captures
 
     long long viewer;                   // viewer id, 0 anon
-    int refs;
+    int refs;                           // atomic: base conn ref + holds
     bool dead;
     bool responded;
+    int respond_status;                 // deferred response (pool thread)
+    bool respond_empty;
 } api_request;
 
 // conn_hooks impl (main.c wires these)
@@ -43,8 +45,16 @@ void req_hold(api_request *r);
 // drop one ref; false = last one, r freed
 bool req_release(api_request *r);
 
-/* queues r->out and consumes the req; caller already dropped its async ref,
- * so refs == 1 is the conn's */
+/* pg submits with r referenced across the callback: the trampoline forwards to
+ * cb and drops the hold after it returns, so a conn close can never free r
+ * while its result renders on the offload pool. ctx is cb's, not r's */
+void api_pg_read(api_request *r, pg_read_kind kind, const pg_read *read,
+                 void *ctx, pg_cb cb);
+void api_pg_write(api_request *r, pg_stmt stmt, int nparams,
+                  const char *const *params, void *ctx, pg_cb cb);
+
+/* queues the response and consumes the req; usable from any thread (a pool
+ * thread defers the write back to the conn's loop) */
 void req_respond(api_request *r, int status);
 void req_respond_empty(api_request *r, int status);
 void req_fail(api_request *r, int status, const char *message);

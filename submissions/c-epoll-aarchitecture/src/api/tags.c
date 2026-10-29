@@ -6,7 +6,7 @@
 
 static void tags_loaded(void *ctx, pg_status status, const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
     if (status == PG_ERROR) {
         req_db_fail(r);
         return;
@@ -23,6 +23,5 @@ static void tags_loaded(void *ctx, pg_status status, const pg_result *res) {
 }
 
 void handle_tags_list(api_request *r) {
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_TAGS, NULL, r, tags_loaded);
+    api_pg_read(r, PG_READ_TAGS, NULL, r, tags_loaded);
 }

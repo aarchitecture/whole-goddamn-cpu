@@ -22,6 +22,6 @@ char *arena_strdup(arena *a, const char *s);
 
 // two vsnprintf passes, one alloc
 char *arena_printf(arena *a, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3), nonnull(2)));
+__attribute__((format(printf, 2, 3), nonnull(2)));
 
 #endif

@@ -29,7 +29,7 @@ typedef struct page_state {
 static void article_loaded(void *ctx, pg_status status,
                            const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ROWS && pg_result_rows(res) >= 1) {
         article_view view;
@@ -47,7 +47,7 @@ static void article_loaded(void *ctx, pg_status status,
 static void article_created(void *ctx, pg_status status,
                             const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ROWS && pg_result_rows(res) >= 1) {
         article_view view;
@@ -70,7 +70,7 @@ static void article_created(void *ctx, pg_status status,
 static void page_loaded(void *ctx, pg_status status, const pg_result *res) {
     page_state *state = ctx;
     api_request *r = state->r;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
     if (status == PG_ERROR) {
         req_db_fail(r);
         return;
@@ -100,25 +100,25 @@ static void page_loaded(void *ctx, pg_status status, const pg_result *res) {
 
 static void page_begin(page_state *state) {
     api_request *r = state->r;
-    pg_read_kind kind;
     const char *key = state->filter ? state->filter : "";
 
+    unsigned char list_kind;
     switch (state->kind) {
     case PAGE_TAG:
-        kind = PG_READ_LIST_TAG;
+        list_kind = PG_LIST_TAG;
         break;
     case PAGE_AUTHOR:
-        kind = PG_READ_LIST_AUTHOR;
+        list_kind = PG_LIST_AUTHOR;
         break;
     case PAGE_FAVORITED:
-        kind = PG_READ_LIST_FAVORITED;
+        list_kind = PG_LIST_FAVORITED;
         break;
     case PAGE_FEED:
-        kind = PG_READ_FEED;
+        list_kind = PG_LIST_FEED;
         break;
     case PAGE_ALL:
     default:
-        kind = PG_READ_LIST_ALL;
+        list_kind = PG_LIST_ALL;
         key = "";
         break;
     }
@@ -128,9 +128,9 @@ static void page_begin(page_state *state) {
         .limit = (int)state->limit,
         .offset = state->offset,
         .key = key,
+        .list_kind = list_kind,
     };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, kind, &read, state, page_loaded);
+    api_pg_read(r, PG_READ_LIST, &read, state, page_loaded);
 }
 
 void handle_articles_list(api_request *r) {
@@ -209,8 +209,7 @@ void handle_article_get(api_request *r) {
         .viewer = r->viewer,
         .key = r->seg[0],
     };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_ARTICLE_SLUG, &read, r,
+    api_pg_read(r, PG_READ_ARTICLE_SLUG, &read, r,
                    article_loaded);
 }
 
@@ -245,15 +244,14 @@ void handle_article_create(api_request *r) {
 
     const char *params[5] = { req_ll(r, r->viewer), title, description, body,
                               tag_array };
-    req_hold(r);
-    pg_submit(r->worker->pg, PG_STMT_ARTICLE_INSERT, 5, params, r,
+    api_pg_write(r, PG_STMT_ARTICLE_INSERT, 5, params, r,
               article_created);
 }
 
 static void article_updated(void *ctx, pg_status status,
                             const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ERROR) {
         req_db_fail(r);
@@ -282,7 +280,7 @@ static void article_updated(void *ctx, pg_status status,
 static void article_deleted(void *ctx, pg_status status,
                             const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ERROR) {
         req_db_fail(r);
@@ -318,14 +316,12 @@ void handle_article_update(api_request *r) {
 
     const char *params[5] = { req_ll(r, r->viewer), r->seg[0], title,
                               description, body };
-    req_hold(r);
-    pg_submit(r->worker->pg, PG_STMT_ARTICLE_UPDATE, 5, params, r,
+    api_pg_write(r, PG_STMT_ARTICLE_UPDATE, 5, params, r,
               article_updated);
 }
 
 void handle_article_delete(api_request *r) {
     const char *params[2] = { req_ll(r, r->viewer), r->seg[0] };
-    req_hold(r);
-    pg_submit(r->worker->pg, PG_STMT_ARTICLE_DELETE, 2, params, r,
+    api_pg_write(r, PG_STMT_ARTICLE_DELETE, 2, params, r,
               article_deleted);
 }

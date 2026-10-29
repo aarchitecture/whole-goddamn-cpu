@@ -26,13 +26,18 @@ typedef enum {
     PG_READ_PROFILE,
     PG_READ_USER_ID,
     PG_READ_USER_EMAIL,
-    PG_READ_LIST_ALL,
-    PG_READ_LIST_TAG,
-    PG_READ_LIST_AUTHOR,
-    PG_READ_LIST_FAVORITED,
-    PG_READ_FEED,
+    PG_READ_LIST,
     PG_READ_COUNT,
 } pg_read_kind;
+
+/* PG_READ_LIST branches per request on this kind (the r.t column) */
+typedef enum {
+    PG_LIST_ALL = 0,
+    PG_LIST_TAG,
+    PG_LIST_AUTHOR,
+    PG_LIST_FAVORITED,
+    PG_LIST_FEED,
+} pg_list_kind;
 
 extern const char *const PG_STMT_SQL[PG_STMT_COUNT];
 extern const unsigned char PG_STMT_PARAM_COUNT[PG_STMT_COUNT];

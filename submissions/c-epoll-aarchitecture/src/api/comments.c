@@ -8,7 +8,7 @@
 static void comment_listed(void *ctx, pg_status status,
                            const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
     if (status == PG_ERROR) {
         req_db_fail(r);
         return;
@@ -37,7 +37,7 @@ static void comment_listed(void *ctx, pg_status status,
 static void comment_created(void *ctx, pg_status status,
                             const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ROWS && pg_result_rows(res) >= 1) {
         comment_view view;
@@ -55,7 +55,7 @@ static void comment_created(void *ctx, pg_status status,
 static void comment_deleted(void *ctx, pg_status status,
                             const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ERROR) {
         req_db_fail(r);
@@ -77,8 +77,7 @@ void handle_comments_list(api_request *r) {
         .viewer = r->viewer,
         .key = r->seg[0],
     };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_COMMENTS, &read, r, comment_listed);
+    api_pg_read(r, PG_READ_COMMENTS, &read, r, comment_listed);
 }
 
 void handle_comments_create(api_request *r) {
@@ -94,8 +93,7 @@ void handle_comments_create(api_request *r) {
     }
 
     const char *params[3] = { req_ll(r, r->viewer), r->seg[0], body };
-    req_hold(r);
-    pg_submit(r->worker->pg, PG_STMT_COMMENTS_INSERT, 3, params, r,
+    api_pg_write(r, PG_STMT_COMMENTS_INSERT, 3, params, r,
               comment_created);
 }
 
@@ -116,7 +114,6 @@ void handle_comment_delete(api_request *r) {
     }
 
     const char *params[3] = { req_ll(r, r->viewer), r->seg[0], comment_id };
-    req_hold(r);
-    pg_submit(r->worker->pg, PG_STMT_COMMENTS_DELETE, 3, params, r,
+    api_pg_write(r, PG_STMT_COMMENTS_DELETE, 3, params, r,
               comment_deleted);
 }

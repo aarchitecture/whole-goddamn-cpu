@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -44,6 +45,7 @@ srv_conn *conn_create(srv_worker *worker, int fd, const conn_hooks *hooks) {
     c->last_active_ms = now_ms();
     buf_init(&c->in);
     buf_init(&c->out);
+    buf_init(&c->out_body);
 
     c->ev = loop_add(worker->loop, fd, LOOP_IN, conn_on_event, c);
     if (!c->ev) {
@@ -67,6 +69,7 @@ void conn_close(srv_conn *c) {
     close(c->fd);
     buf_free(&c->in);
     buf_free(&c->out);
+    buf_free(&c->out_body);
     conn_unlink(c);
     free(c);
 }
@@ -176,10 +179,25 @@ static bool conn_parse(srv_conn *c) {
 }
 
 static bool conn_flush(srv_conn *c) {
-    while (c->out.len > 0) {
-        ssize_t n = send(c->fd, c->out.data, c->out.len, MSG_NOSIGNAL);
+    while (c->out.len > 0 || c->out_body.len - c->out_body_off > 0) {
+        struct iovec iov[2];
+        int nio = 0;
+        if (c->out.len > 0) {
+            iov[nio].iov_base = c->out.data;
+            iov[nio].iov_len = c->out.len;
+            nio++;
+        }
+        size_t body_left = c->out_body.len - c->out_body_off;
+        if (body_left > 0) {
+            iov[nio].iov_base = c->out_body.data + c->out_body_off;
+            iov[nio].iov_len = body_left;
+            nio++;
+        }
+        ssize_t n = writev(c->fd, iov, nio);
         if (n > 0) {
-            buf_consume(&c->out, (size_t)n);
+            size_t hdr = (size_t)n < c->out.len ? (size_t)n : c->out.len;
+            buf_consume(&c->out, hdr);
+            c->out_body_off += (size_t)n - hdr;
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
@@ -195,6 +213,8 @@ static bool conn_flush(srv_conn *c) {
         c->in_start += c->request_len;
         c->request_len = 0;
         c->state = CONN_OPEN;
+        buf_free(&c->out_body);
+        c->out_body_off = 0;
 
         if (c->in_start == c->in.len) {
             c->in.len = 0;
@@ -222,20 +242,51 @@ static bool conn_flush(srv_conn *c) {
     return true;
 }
 
+/* "HTTP/1.1 %d %s" by hand: no two-pass vsnprintf just to write a header.
+* with_length mirrors the old split: len headers on JSON responses only */
+static void queue_header(buf *out, int status, size_t body_len,
+                         bool with_length, bool close) {
+    const char *text = http_status_text(status);
+    BUF_LIT(out, "HTTP/1.1 ");
+    buf_num(out, status);
+    BUF_LIT(out, " ");
+    buf_append(out, text, strlen(text));
+    if (with_length) {
+        static const char CT[] =
+            "\r\nContent-Type: application/json\r\nContent-Length: ";
+        BUF_LIT(out, CT);
+        buf_num(out, (long long)body_len);
+    }
+    static const char CLOSE[] = "\r\nConnection: close\r\n\r\n";
+    static const char KEEP[] = "\r\nConnection: keep-alive\r\n\r\n";
+    if (close) buf_append(out, CLOSE, sizeof CLOSE - 1);
+    else buf_append(out, KEEP, sizeof KEEP - 1);
+}
+
 void conn_respond(srv_conn *c, int status, const char *body, size_t body_len) {
     CHECK(c->state == CONN_REQUEST, "response without an in-flight request");
     CHECK(c->out.len == 0, "response queued over an unflushed response");
+    CHECK(c->out_body.len == c->out_body_off, "response body still in flight");
     CHECK(body_len == 0 || body != NULL, "response body pointer");
 
-    buf_printf(&c->out,
-               "HTTP/1.1 %d %s\r\n"
-               "Content-Type: application/json\r\n"
-               "Content-Length: %zu\r\n"
-               "Connection: %s\r\n"
-               "\r\n",
-               status, http_status_text(status), body_len,
-               c->close_after ? "close" : "keep-alive");
+    queue_header(&c->out, status, body_len, true, c->close_after);
     if (body_len) buf_append(&c->out, body, body_len);
+
+    c->state = CONN_RESPONSE;
+    loop_set_events(c->worker->loop, c->ev, LOOP_IN | LOOP_OUT);
+}
+
+void conn_respond_move(srv_conn *c, int status, buf *body) {
+    CHECK(c->state == CONN_REQUEST, "response without an in-flight request");
+    CHECK(c->out.len == 0, "response queued over an unflushed response");
+    CHECK(c->out_body.len == c->out_body_off, "response body still in flight");
+    CHECK(body->len == 0 || body->data != NULL, "response body pointer");
+
+    queue_header(&c->out, status, body->len, true, c->close_after);
+    if (body->len) {
+        c->out_body = *body;    // ownership moves to the conn; freed on flush
+        buf_init(body);
+    }
 
     c->state = CONN_RESPONSE;
     loop_set_events(c->worker->loop, c->ev, LOOP_IN | LOOP_OUT);
@@ -244,13 +295,9 @@ void conn_respond(srv_conn *c, int status, const char *body, size_t body_len) {
 void conn_respond_empty(srv_conn *c, int status) {
     CHECK(c->state == CONN_REQUEST, "response without an in-flight request");
     CHECK(c->out.len == 0, "response queued over an unflushed response");
+    CHECK(c->out_body.len == c->out_body_off, "response body still in flight");
 
-    buf_printf(&c->out,
-               "HTTP/1.1 %d %s\r\n"
-               "Connection: %s\r\n"
-               "\r\n",
-               status, http_status_text(status),
-               c->close_after ? "close" : "keep-alive");
+    queue_header(&c->out, status, 0, false, c->close_after);
 
     c->state = CONN_RESPONSE;
     loop_set_events(c->worker->loop, c->ev, LOOP_IN | LOOP_OUT);

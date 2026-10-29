@@ -40,6 +40,8 @@ struct srv_conn {
     buf in;
     size_t in_start;            // consumed prefix of in
     buf out;
+    size_t out_body_off;        // consumed prefix of out_body
+    buf out_body;               // moved response body, sent via writev
     size_t request_len;         // in-flight req bytes (header+body)
 
     http_request rq;            // valid for req lifetime
@@ -60,8 +62,12 @@ void conn_sweep(struct srv_worker *w);
 // close one CONN_OPEN conn; 1 if one freed
 int conn_close_one_idle(struct srv_worker *w);
 
-/* queue full response + arm write event; caller has exactly 1 req in flight */
+/* queue full response + arm write event; caller has exactly 1 req in flight.
+ * conn_respond copies the body (static strings, rejects);
+ * conn_respond_move takes ownership of `body` and frees it after the flush,
+ * sparing the copy */
 void conn_respond(srv_conn *c, int status, const char *body, size_t body_len);
+void conn_respond_move(srv_conn *c, int status, buf *body);
 void conn_respond_empty(srv_conn *c, int status);
 
 #endif

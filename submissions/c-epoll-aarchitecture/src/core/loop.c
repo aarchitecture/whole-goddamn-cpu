@@ -122,7 +122,8 @@ static void timer_event(void *user, loop_fd *self, unsigned events) {
     (void)events;
     loop *l = user;
     uint64_t ticks;
-    while (read(l->timer_fd, &ticks, sizeof ticks) > 0) { }
+    while (read(l->timer_fd, &ticks, sizeof ticks) > 0) {
+    }
     l->timer_fn(l->timer_user);
 }
 
@@ -148,7 +149,10 @@ void loop_timer(loop *l, int interval_ms, loop_timer_fn *fn, void *user) {
     CHECK(l->timer_source != NULL, "loop_add timerfd failed");
 }
 
+static __thread loop *t_current;    // loop running on this thread, else NULL
+
 void loop_run(loop *l, int timeout_ms) {
+    t_current = l;
     struct epoll_event ready[128];
     int n = epoll_wait(l->ep, ready, (int)(sizeof ready / sizeof ready[0]),
                        timeout_ms);
@@ -174,4 +178,9 @@ void loop_run(loop *l, int timeout_ms) {
         free(z);
         z = next;
     }
+    t_current = NULL;
+}
+
+loop *loop_current(void) {
+    return t_current;
 }

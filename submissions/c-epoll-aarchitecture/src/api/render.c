@@ -20,6 +20,54 @@ static bool is_true(const pg_result *res, int row, int col) {
     return strcmp(pg_result_value(res, row, col), "t") == 0;
 }
 
+/* epoch micros -> RFC 3339 UTC with exactly 3 fractional digits (truncated);
+ * civil date via Howard Hinnant's civil_from_days */
+static void render_ts(buf *out, long long micros) {
+    long long secs = micros / 1000000;
+    long long ms = (micros / 1000) % 1000;
+    long long sod = secs % 86400;
+    long long hh = sod / 3600;
+    long long mm = (sod / 60) % 60;
+    long long ss = sod % 60;
+
+    long long z = secs / 86400 + 719468;
+    long long era = (z >= 0 ? z : z - 146096) / 146097;
+    long long doe = z - era * 146097;
+    long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long long y = yoe + era * 400;
+    long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    long long mp = (5 * doy + 2) / 153;
+    long long d = doy - (153 * mp + 2) / 5 + 1;
+    long long m = mp + (mp < 10 ? 3 : -9);
+    if (m <= 2) y++;
+
+    char year[5] = {
+        (char)('0' + y / 1000 % 10), (char)('0' + y / 100 % 10),
+        (char)('0' + y / 10 % 10), (char)('0' + y % 10), 0,
+    };
+    buf_append(out, year, 4);
+    buf_putc(out, '-');
+    buf_putc(out, (char)('0' + m / 10));
+    buf_putc(out, (char)('0' + m % 10));
+    buf_putc(out, '-');
+    buf_putc(out, (char)('0' + d / 10));
+    buf_putc(out, (char)('0' + d % 10));
+    BUF_LIT(out, "T");
+    buf_putc(out, (char)('0' + hh / 10));
+    buf_putc(out, (char)('0' + hh % 10));
+    buf_putc(out, ':');
+    buf_putc(out, (char)('0' + mm / 10));
+    buf_putc(out, (char)('0' + mm % 10));
+    buf_putc(out, ':');
+    buf_putc(out, (char)('0' + ss / 10));
+    buf_putc(out, (char)('0' + ss % 10));
+    buf_putc(out, '.');
+    buf_putc(out, (char)('0' + ms / 100));
+    buf_putc(out, (char)('0' + ms / 10 % 10));
+    buf_putc(out, (char)('0' + ms % 10));
+    buf_putc(out, 'Z');
+}
+
 static const char *optional(const pg_result *res, int row, int col,
                             bool *is_null) {
     *is_null = pg_result_is_null(res, row, col);
@@ -58,8 +106,8 @@ void article_view_load(article_view *v, const pg_result *res, int row,
         v->body = pg_result_value(res, row, 4);
         v->body_present = true;
     }
-    v->created_at = pg_result_value(res, row, created_col);
-    v->updated_at = pg_result_value(res, row, created_col + 1);
+    v->created_at = parse_id(res, row, created_col);
+    v->updated_at = parse_id(res, row, created_col + 1);
     v->tags = optional(res, row, tags_col, &v->tags_null);
     v->favorites_count = pg_result_value(res, row, count_col);
     v->favorited = is_true(res, row, favorited_col);
@@ -74,8 +122,8 @@ void comment_view_load(comment_view *v, const pg_result *res, int row,
     memset(v, 0, sizeof *v);
     v->id = parse_id(res, row, 0);
     v->body = pg_result_value(res, row, 1);
-    v->created_at = pg_result_value(res, row, 2);
-    v->updated_at = pg_result_value(res, row, 3);
+    v->created_at = parse_id(res, row, 2);
+    v->updated_at = parse_id(res, row, 3);
     v->author_username = pg_result_value(res, row, 4);
     v->author_bio = optional(res, row, 5, &v->author_bio_null);
     v->author_image = optional(res, row, 6, &v->author_image_null);
@@ -138,7 +186,7 @@ void render_tag_array(buf *out, const char *literal) {
     buf_free(&element);
     return;
 
-malformed:
+    malformed:
     buf_free(&element);
     /* caller already wrote '['; must close it */
     BUF_LIT(out, "]");
@@ -195,11 +243,11 @@ void render_article(buf *out, const article_view *v) {
     BUF_LIT(out, ",\"tagList\":");
     if (v->tags_null) BUF_LIT(out, "[]");
     else render_tag_array(out, v->tags);
-    BUF_LIT(out, ",\"createdAt\":");
-    json_quote(out, v->created_at);
-    BUF_LIT(out, ",\"updatedAt\":");
-    json_quote(out, v->updated_at);
-    BUF_LIT(out, ",\"favorited\":");
+    BUF_LIT(out, ",\"createdAt\":\"");
+    render_ts(out, v->created_at);
+    BUF_LIT(out, "\",\"updatedAt\":\"");
+    render_ts(out, v->updated_at);
+    BUF_LIT(out, "\",\"favorited\":");
     render_bool(out, v->favorited);
     BUF_LIT(out, ",\"favoritesCount\":");
     buf_append(out, v->favorites_count, strlen(v->favorites_count));
@@ -215,11 +263,11 @@ void render_article(buf *out, const article_view *v) {
 }
 
 void render_comment(buf *out, const comment_view *v) {
-    buf_printf(out, "{\"id\":%lld,\"createdAt\":", v->id);
-    json_quote(out, v->created_at);
-    BUF_LIT(out, ",\"updatedAt\":");
-    json_quote(out, v->updated_at);
-    BUF_LIT(out, ",\"body\":");
+    buf_printf(out, "{\"id\":%lld,\"createdAt\":\"", v->id);
+    render_ts(out, v->created_at);
+    BUF_LIT(out, "\",\"updatedAt\":\"");
+    render_ts(out, v->updated_at);
+    BUF_LIT(out, "\",\"body\":");
     json_quote(out, v->body);
     BUF_LIT(out, ",\"author\":{\"username\":");
     json_quote(out, v->author_username);

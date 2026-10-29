@@ -31,4 +31,7 @@ void loop_remove(loop *l, loop_fd *e);
 /* one periodic callback per loop (idle sweep) */
 void loop_timer(loop *l, int interval_ms, loop_timer_fn *fn, void *user);
 
+/* the loop running on THIS thread, or NULL off-loop (pool threads) */
+loop *loop_current(void);
+
 #endif

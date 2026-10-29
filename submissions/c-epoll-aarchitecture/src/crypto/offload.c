@@ -133,3 +133,25 @@ void crypto_submit(int worker_id, crypto_work_fn work, crypto_resume_fn resume,
     pthread_mutex_unlock(&queue.mu);
     pthread_cond_signal(&queue.cv);
 }
+
+/* no pool work: park `arg` straight on the worker's mailbox so `resume` runs on
+ * the worker's loop (thread hop only) */
+void crypto_post(int worker_id, crypto_resume_fn resume, void *arg) {
+    CHECK(worker_id >= 0 && worker_id < mailbox_count, "crypto_post: worker id");
+    CHECK(resume != NULL, "crypto_post: resume required");
+
+    struct job *job = xmalloc(sizeof *job);
+    job->work = NULL;
+    job->resume = resume;
+    job->arg = arg;
+    job->worker = worker_id;
+    job->next = NULL;
+
+    struct mailbox *mailbox = &mailboxes[worker_id];
+    pthread_mutex_lock(&mailbox->mu);
+    if (mailbox->tail) mailbox->tail->next = job;
+    else mailbox->head = job;
+    mailbox->tail = job;
+    pthread_mutex_unlock(&mailbox->mu);
+    wake_fire(mailbox->wake_fd);
+}

@@ -23,5 +23,6 @@ void wake_fire(int fd) {
 
 void wake_drain(int fd) {
     uint64_t counter;
-    while (read(fd, &counter, sizeof counter) > 0) { }
+    while (read(fd, &counter, sizeof counter) > 0) {
+    }
 }

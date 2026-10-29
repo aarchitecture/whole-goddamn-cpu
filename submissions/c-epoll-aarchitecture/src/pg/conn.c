@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "core/buf.h"
+#include "crypto/offload.h"
 #include "util.h"
 
 static void pg_conn_event(void *user, loop_fd *self, unsigned events);
@@ -23,11 +24,13 @@ static void setup_poll(pg_conn *cn);
 
 static pg_status status_of(PGresult *r) {
     if (!r) return PG_ERROR;
+    // *UNCRUSTIFY-OFF*
     switch (PQresultStatus(r)) {
     case PGRES_TUPLES_OK: return PG_ROWS;
     case PGRES_COMMAND_OK: return PG_COMMAND;
     default: return PG_ERROR;
     }
+    // *UNCRUSTIFY-ON*
 }
 
 static pg_pending *pending_pop(pg_conn *cn) {
@@ -52,6 +55,46 @@ static void group_clear(pg_conn *cn) {
     cn->group_total = 0;
     cn->group_failed = false;
     cn->in_pipeline = false;
+}
+
+/* pg result callbacks run on the offload pool: tuple parsing + JSON rendering
+ * is the heavy per-response CPU and must stay off the io threads. the job owns
+ * the result (write results are cleared), the pending, and one batch reference
+ * for reads; everything it touches is refcounted or heap-only */
+struct render_job {
+    pg_cb cb;
+    void *ctx;
+    pg_status status;
+    pg_result view;
+    pg_pending *p;
+    pg_batch_hold *hold;        // read batches: released after cb
+    PGresult *raw;              // write results: cleared after cb
+};
+
+static void render_work(void *arg) {
+    struct render_job *job = arg;
+    job->cb(job->ctx, job->status, &job->view);
+    if (job->raw) PQclear(job->raw);
+    if (job->p) pg_pending_free(job->p);
+    if (job->hold) pg_hold_release(job->hold);
+}
+
+static void render_done(void *arg) {
+    (void)arg;
+}
+
+void pg_render_async(pg_pending *p, pg_status status, pg_result view,
+                     pg_batch_hold *hold, PGresult *raw) {
+    struct render_job *job = xmalloc(sizeof *job);
+    job->cb = p->cb;
+    job->ctx = p->ctx;
+    job->status = status;
+    job->view = view;
+    job->p = p;
+    job->hold = hold;
+    job->raw = raw;
+    if (hold) __atomic_fetch_add(&hold->refs, 1, __ATOMIC_SEQ_CST);
+    crypto_submit(p->home->worker_id, render_work, render_done, job);
 }
 
 static bool send_pending(pg_conn *cn, const pg_pending *p) {
@@ -88,16 +131,20 @@ static bool send_read(pg_conn *cn, pg_read_kind kind, pg_pending **reqs,
     buf limit;
     buf offset;
     buf key;
+    buf lkind;
+    bool merged = kind == PG_READ_LIST;
     buf_init(&index);
     buf_init(&viewer);
     buf_init(&limit);
     buf_init(&offset);
     buf_init(&key);
+    buf_init(&lkind);
     buf_putc(&index, '{');
     buf_putc(&viewer, '{');
     buf_putc(&limit, '{');
     buf_putc(&offset, '{');
     buf_putc(&key, '{');
+    buf_putc(&lkind, '{');
 
     for (int i = 0; i < n; i++) {
         if (i) {
@@ -106,33 +153,41 @@ static bool send_read(pg_conn *cn, pg_read_kind kind, pg_pending **reqs,
             buf_putc(&limit, ',');
             buf_putc(&offset, ',');
             buf_putc(&key, ',');
+            buf_putc(&lkind, ',');
         }
         buf_printf(&index, "%d", i);
         buf_printf(&viewer, "%lld", reqs[i]->viewer);
         buf_printf(&limit, "%d", reqs[i]->limit);
         buf_printf(&offset, "%lld", reqs[i]->offset);
         encode_text_element(&key, reqs[i]->key);
+        buf_printf(&lkind, "%d", (int)reqs[i]->list_kind);
     }
     buf_putc(&index, '}');
     buf_putc(&viewer, '}');
     buf_putc(&limit, '}');
     buf_putc(&offset, '}');
     buf_putc(&key, '}');
+    buf_putc(&lkind, '}');
     /* libpq wants C strings; buf doesn't terminate, so add NUL in reserved cap */
     buf_putc(&index, '\0');
     buf_putc(&viewer, '\0');
     buf_putc(&limit, '\0');
     buf_putc(&offset, '\0');
     buf_putc(&key, '\0');
+    buf_putc(&lkind, '\0');
 
-    const char *params[5] = { index.data, viewer.data, limit.data,
-                              offset.data, key.data };
-    int rc = PQsendQueryPrepared(cn->raw, name, 5, params, NULL, NULL, 0);
+    const char *params5[5] = { index.data, viewer.data, limit.data,
+                               offset.data, key.data };
+    const char *params6[6] = { index.data, viewer.data, limit.data,
+                               offset.data, key.data, lkind.data };
+    int rc = PQsendQueryPrepared(cn->raw, name, merged ? 6 : 5,
+                                 merged ? params6 : params5, NULL, NULL, 0);
     buf_free(&index);
     buf_free(&viewer);
     buf_free(&limit);
     buf_free(&offset);
     buf_free(&key);
+    buf_free(&lkind);
     return rc == 1;
 }
 
@@ -364,9 +419,7 @@ static void pg_conn_deliver_one(pg_conn *cn, PGresult *r) {
         .rows = r ? PQntuples(r) : 0,
         .col_offset = 0,
     };
-    p->cb(p->ctx, status_of(r), &view);
-    if (r) PQclear(r);
-    pg_pending_free(p);
+    pg_render_async(p, status_of(r), view, NULL, r);
 }
 
 static void pg_conn_deliver_group(pg_conn *cn) {
@@ -385,9 +438,7 @@ static void pg_conn_deliver_group(pg_conn *cn) {
             .rows = r ? PQntuples(r) : 0,
             .col_offset = 0,
         };
-        p->cb(p->ctx, status, &view);
-        if (r) PQclear(r);
-        pg_pending_free(p);
+        pg_render_async(p, status, view, NULL, r);
     }
     cn->group_sent = 0;
     cn->group_got = 0;
@@ -494,7 +545,7 @@ static void pg_conn_deliver_read(pg_conn *cn, PGresult *r) {
         if (p->home == cn->pool) {
             if (!valid) {
                 pg_result view = { .raw = r };
-                p->cb(p->ctx, PG_ERROR, &view);
+                pg_render_async(p, PG_ERROR, view, hold, NULL);
             } else if (broadcast) {
                 pg_result view = {
                     .raw = r,
@@ -502,7 +553,7 @@ static void pg_conn_deliver_read(pg_conn *cn, PGresult *r) {
                     .rows = PQntuples(r),
                     .col_offset = 0,
                 };
-                p->cb(p->ctx, PG_ROWS, &view);
+                pg_render_async(p, PG_ROWS, view, hold, NULL);
             } else {
                 pg_result view = {
                     .raw = r,
@@ -510,9 +561,8 @@ static void pg_conn_deliver_read(pg_conn *cn, PGresult *r) {
                     .rows = count ? count[i] : 0,
                     .col_offset = 1,
                 };
-                p->cb(p->ctx, PG_ROWS, &view);
+                pg_render_async(p, PG_ROWS, view, hold, NULL);
             }
-            pg_pending_free(p);
             continue;
         }
 

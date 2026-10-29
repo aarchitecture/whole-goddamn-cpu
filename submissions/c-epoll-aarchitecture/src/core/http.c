@@ -197,6 +197,7 @@ http_result http_parse(const char *buf, size_t len, size_t *header_len,
 }
 
 const char *http_status_text(int status) {
+    // *UNCRUSTIFY-OFF*
     switch (status) {
     case 200: return "OK";
     case 201: return "Created";
@@ -209,4 +210,5 @@ const char *http_status_text(int status) {
     case 422: return "Unprocessable Entity";
     default:  return "Unknown";
     }
+    // *UNCRUSTIFY-ON*
 }

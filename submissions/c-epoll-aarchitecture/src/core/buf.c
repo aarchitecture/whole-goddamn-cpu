@@ -1,6 +1,7 @@
 #include "core/buf.h"
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -73,4 +74,18 @@ void buf_consume(buf *b, size_t n) {
     size_t left = b->len - n;
     if (left) memmove(b->data, b->data + n, left);
     b->len = left;
+}
+
+void buf_num(buf *b, long long v) {
+    bool neg = v < 0;
+    unsigned long long u =
+        neg ? -(unsigned long long)v : (unsigned long long)v;
+    char tmp[24];
+    size_t i = sizeof tmp;
+    do {
+        tmp[--i] = (char)('0' + u % 10);
+        u /= 10;
+    } while (u);
+    if (neg) tmp[--i] = '-';
+    buf_append(b, tmp + i, sizeof tmp - i);
 }

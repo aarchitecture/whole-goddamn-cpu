@@ -3,6 +3,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "crypto/offload.h"
+#include "core/loop.h"
 #include "core/wake.h"
 #include "util.h"
 
@@ -202,7 +204,8 @@ void pg_sched_post_errors(pg_pending *list) {
         it->status = PG_ERROR;  // view stays zeroed: PG_ERROR, no result
 
         int b = 0;
-        for (; b < nbags && bag[b].home != p->home; b++) {}
+        for (; b < nbags && bag[b].home != p->home; b++) {
+        }
         if (b == nbags) {
             CHECK(nbags < PG_SCHED_MAX_WORKERS, "pg: too many worker groups");
             bag[b].home = p->home;
@@ -280,9 +283,9 @@ static void resume_ready(void *user, loop_fd *self, unsigned events) {
 
     while (it) {
         pg_remote_item *next = it->next;
-        it->p->cb(it->p->ctx, it->status, it->viewp);
-        pg_pending_free(it->p);
-        if (it->hold) pg_hold_release(it->hold);
+        pg_result view = it->viewp ? *it->viewp : (pg_result){0};
+        pg_render_async(it->p, it->status, view, it->hold, NULL);
+        if (it->hold) pg_hold_release(it->hold);    // item's ref; job took its own
         free(it);
         it = next;
     }
@@ -307,7 +310,8 @@ void pg_pending_free(pg_pending *p) {
 
 void pg_pool_open(pg_pool **out, const char *url, int read_conns,
                   int write_conns, int read_batch, int read_window_ms,
-                  int write_group, int write_window_ms, loop *l) {
+                  int write_group, int write_window_ms, int worker_id,
+                  loop *l) {
     CHECK(read_conns >= 1, "pg: at least one read connection is required");
     CHECK(write_conns >= 1, "pg: at least one write connection is required");
     CHECK(read_batch >= 1, "pg: read batch must be positive");
@@ -318,6 +322,7 @@ void pg_pool_open(pg_pool **out, const char *url, int read_conns,
 
     pg_pool *pool = xcalloc(1, sizeof *pool);
     pool->loop = l;
+    pool->worker_id = worker_id;
     pool->url = xmalloc(strlen(url) + 1);
     strcpy(pool->url, url);
     pool->read_conns = read_conns;
@@ -367,6 +372,39 @@ static pg_conn *pool_pick_write(pg_pool *pool) {
     return best;
 }
 
+/* off-loop submits (a render callback chaining another pg op) marshal to the
+ * home loop: PGconns are only touched by their own pool's thread */
+struct pg_submit_job {
+    pg_pool *pool;
+    pg_stmt stmt;
+    int nparams;
+    const char **params;
+    void *ctx;
+    pg_cb cb;
+};
+
+static void pg_submit_run(void *arg) {
+    struct pg_submit_job *job = arg;
+    pg_submit(job->pool, job->stmt, job->nparams, job->params, job->ctx,
+              job->cb);
+    free(job->params);
+    free(job);
+}
+
+struct pg_read_job {
+    pg_pool *pool;
+    pg_read_kind kind;
+    pg_read read;
+    void *ctx;
+    pg_cb cb;
+};
+
+static void pg_read_submit_run(void *arg) {
+    struct pg_read_job *job = arg;
+    pg_read_submit(job->pool, job->kind, &job->read, job->ctx, job->cb);
+    free(job);
+}
+
 void pg_submit(pg_pool *pool, pg_stmt stmt, int nparams,
                const char *const *params, void *ctx, pg_cb cb) {
     CHECK(stmt >= 0 && stmt < PG_STMT_COUNT, "pg_submit: bad statement %d", stmt);
@@ -375,6 +413,21 @@ void pg_submit(pg_pool *pool, pg_stmt stmt, int nparams,
           (unsigned)PG_STMT_PARAM_COUNT[stmt], nparams);
     CHECK(nparams == 0 || params != NULL, "pg_submit: missing parameters");
     CHECK(cb != NULL, "pg_submit: callback is required");
+
+    if (loop_current() != pool->loop) {
+        struct pg_submit_job *job = xmalloc(sizeof *job);
+        job->pool = pool;
+        job->stmt = stmt;
+        job->nparams = nparams;
+        job->params = nparams ? xmalloc((size_t)nparams * sizeof *job->params)
+                              : NULL;
+        if (nparams)
+            memcpy(job->params, params, (size_t)nparams * sizeof *job->params);
+        job->ctx = ctx;
+        job->cb = cb;
+        crypto_post(pool->worker_id, pg_submit_run, job);
+        return;
+    }
 
     pg_pending *p = xcalloc(1, sizeof *p);
     p->home = pool;
@@ -416,6 +469,17 @@ void pg_read_submit(pg_pool *pool, pg_read_kind kind, const pg_read *read,
     CHECK(kind == PG_READ_TAGS || read != NULL,
           "pg_read_submit: missing read arguments");
 
+    if (loop_current() != pool->loop) {
+        struct pg_read_job *job = xmalloc(sizeof *job);
+        job->pool = pool;
+        job->kind = kind;
+        job->read = read ? *read : (pg_read){0};
+        job->ctx = ctx;
+        job->cb = cb;
+        crypto_post(pool->worker_id, pg_read_submit_run, job);
+        return;
+    }
+
     pg_sched *s = &g_pg_sched;
     pthread_mutex_lock(&s->lock);
     if (s->live_reads == 0) {
@@ -432,6 +496,7 @@ void pg_read_submit(pg_pool *pool, pg_read_kind kind, const pg_read *read,
     p->ctx = ctx;
     p->cb = cb;
     p->seq = ++s->seq;
+    p->list_kind = read ? read->list_kind : 0;
     if (read) {
         p->viewer = read->viewer;
         p->limit = read->limit;

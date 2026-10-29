@@ -22,19 +22,21 @@ typedef enum {
 typedef void (*pg_cb)(void *ctx, pg_status status, const pg_result *res);
 
 /* one read: viewer/limit/offset/key copied into the pool's queue; key borrowed
- * until the callback; unused fields zero */
+ * until the callback; unused fields zero. list_kind selects the branch of the
+ * merged list statement (PG_LIST_*) */
 typedef struct pg_read {
     long long viewer;
     int limit;
     long long offset;
     const char *key;
+    unsigned char list_kind;
 } pg_read;
 
 /* opens read/write conns synchronously, applies session settings, prepares every
  * statement; FATAL on failure */
 void pg_pool_open(pg_pool **out, const char *url, int read_conns,
                   int write_conns, int read_batch, int read_window_ms,
-                  int write_group, int write_window_ms, loop *l);
+                  int write_group, int write_window_ms, int worker_id, loop *l);
 void pg_pool_tick(pg_pool *pool);
 
 /* write stmt; param strings/array borrowed until the callback; params NULL when

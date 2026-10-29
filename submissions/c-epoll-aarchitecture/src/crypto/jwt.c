@@ -1,8 +1,8 @@
 #include "crypto/jwt.h"
 
-#include <openssl/core_names.h>
+#include <limits.h>
 #include <openssl/evp.h>
-#include <openssl/params.h>
+#include <openssl/hmac.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,8 +42,8 @@ static void b64url_encode(buf *out, const unsigned char *in, size_t len) {
 
 static int b64url_value(char ch) {
     static const signed char TABLE[128] = {
-        ['A'] = 0,  ['B'] = 1,  ['C'] = 2,  ['D'] = 3,  ['E'] = 4,  ['F'] = 5,
-        ['G'] = 6,  ['H'] = 7,  ['I'] = 8,  ['J'] = 9,  ['K'] = 10, ['L'] = 11,
+        ['A'] = 0, ['B'] = 1, ['C'] = 2, ['D'] = 3, ['E'] = 4, ['F'] = 5,
+        ['G'] = 6, ['H'] = 7, ['I'] = 8, ['J'] = 9, ['K'] = 10, ['L'] = 11,
         ['M'] = 12, ['N'] = 13, ['O'] = 14, ['P'] = 15, ['Q'] = 16, ['R'] = 17,
         ['S'] = 18, ['T'] = 19, ['U'] = 20, ['V'] = 21, ['W'] = 22, ['X'] = 23,
         ['Y'] = 24, ['Z'] = 25, ['a'] = 26, ['b'] = 27, ['c'] = 28, ['d'] = 29,
@@ -83,27 +83,17 @@ static int b64url_decode(unsigned char *out, size_t out_cap, const char *in,
     return (int)out_len;
 }
 
+/* one-shot HMAC: no provider fetch / ctx allocation on every request (this
+ * runs on every authenticated request), still plain OpenSSL and still one
+ * real SHA-256 over the header+payload each time */
 static bool hmac_sha256(const char *secret, const char *message,
                         size_t message_len, unsigned char out[SHA256_LEN]) {
-    bool ok = false;
-    EVP_MAC *mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
-    if (!mac) return false;
-    EVP_MAC_CTX *ctx = EVP_MAC_CTX_new(mac);
-    if (!ctx) goto done;
-
-    OSSL_PARAM params[2] = {
-        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, (char *)"SHA256", 0),
-        OSSL_PARAM_construct_end(),
-    };
-    size_t out_len = SHA256_LEN;
-    ok = EVP_MAC_init(ctx, (const unsigned char *)secret, strlen(secret), params) == 1
-         && EVP_MAC_update(ctx, (const unsigned char *)message, message_len) == 1
-         && EVP_MAC_final(ctx, out, &out_len, SHA256_LEN) == 1
-         && out_len == SHA256_LEN;
-    EVP_MAC_CTX_free(ctx);
-done:
-    EVP_MAC_free(mac);
-    return ok;
+    unsigned int out_len = 0;
+    if (strlen(secret) > INT_MAX) return false;
+    return HMAC(EVP_sha256(), secret, (int)strlen(secret),
+                (const unsigned char *)message, message_len, out,
+                &out_len) != NULL &&
+           out_len == SHA256_LEN;
 }
 
 bool jwt_mint(buf *out, long long user_id, const char *secret,
@@ -207,7 +197,7 @@ bool jwt_verify(long long *user_id, const char *token, const char *secret) {
 
     *user_id = subject;
     ok = true;
-done:
+    done:
     json_free(claims);
     return ok;
 }

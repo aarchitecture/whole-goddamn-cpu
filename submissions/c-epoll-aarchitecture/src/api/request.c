@@ -2,16 +2,19 @@
 
 #include <string.h>
 
+#include "crypto/offload.h"
+#include "core/loop.h"
 #include "util.h"
 
 void req_hold(api_request *r) {
-    CHECK(r->refs > 0, "request hold after release");
-    r->refs++;
+    int prev = __atomic_fetch_add(&r->refs, 1, __ATOMIC_ACQ_REL);
+    CHECK(prev > 0, "request hold after release");
 }
 
 bool req_release(api_request *r) {
-    CHECK(r->refs > 0, "request release underflow");
-    if (--r->refs > 0) return true;
+    int prev = __atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL);
+    CHECK(prev >= 0, "request release underflow");
+    if (prev > 0) return true;
 
     json_free(r->body);
     arena_reset(&r->arena);
@@ -40,28 +43,86 @@ const char *req_ll(api_request *r, long long value) {
     return arena_printf(&r->arena, "%lld", value);
 }
 
-void req_respond(api_request *r, int status) {
-    CHECK(!r->dead, "response on an abandoned request");
-    CHECK(!r->responded, "double response");
-    CHECK(r->refs == 1, "response with %d outstanding references", r->refs);
+/* pg trampolines: one arena-allocated wrap holds r across the callback and
+ * drops that hold once cb returns, so the ref cb sees is stable even if the
+ * conn is closed mid-render */
+struct api_pg {
+    api_request *r;
+    void *ctx;
+    pg_cb cb;
+};
 
+static void api_pg_trampoline(void *arg, pg_status status,
+                              const pg_result *res) {
+    struct api_pg *w = arg;
+    w->cb(w->ctx, status, res);
+    req_release(w->r);
+}
+
+void api_pg_read(api_request *r, pg_read_kind kind, const pg_read *read,
+                 void *ctx, pg_cb cb) {
+    struct api_pg *w = req_calloc(r, sizeof *w);
+    w->r = r;
+    w->ctx = ctx;
+    w->cb = cb;
+    req_hold(r);
+    pg_read_submit(r->worker->pg, kind, read, w, api_pg_trampoline);
+}
+
+void api_pg_write(api_request *r, pg_stmt stmt, int nparams,
+                  const char *const *params, void *ctx, pg_cb cb) {
+    struct api_pg *w = req_calloc(r, sizeof *w);
+    w->r = r;
+    w->ctx = ctx;
+    w->cb = cb;
+    req_hold(r);
+    pg_submit(r->worker->pg, stmt, nparams, params, w, api_pg_trampoline);
+}
+
+/* deferred finish runs on the conn's loop; refs there = posted hold + conn
+ * base (or just the hold if abandon already dropped the base) */
+static void req_respond_finish(void *arg) {
+    api_request *r = arg;
+    if (r->dead) {
+        req_release(r);
+        return;
+    }
     srv_conn *c = r->conn;
-    r->responded = true;
     c->request = NULL;
-    conn_respond(c, status, r->out.data, r->out.len);
+    if (r->respond_empty) conn_respond_empty(c, r->respond_status);
+    else conn_respond_move(c, r->respond_status, &r->out);
+    req_release(r);
     req_release(r);
 }
 
-void req_respond_empty(api_request *r, int status) {
-    CHECK(!r->dead, "response on an abandoned request");
+static void req_respond_now(api_request *r, int status, bool empty) {
     CHECK(!r->responded, "double response");
-    CHECK(r->refs == 1, "response with %d outstanding references", r->refs);
+
+    if (loop_current() != r->worker->loop) {
+        r->responded = true;
+        r->respond_status = status;
+        r->respond_empty = empty;
+        req_hold(r);
+        crypto_post(r->worker->id, req_respond_finish, r);
+        return;
+    }
+
+    CHECK(!r->dead, "response on an abandoned request");
 
     srv_conn *c = r->conn;
     r->responded = true;
     c->request = NULL;
-    conn_respond_empty(c, status);
+    if (empty) conn_respond_empty(c, status);
+    else conn_respond_move(c, status, &r->out);
     req_release(r);
+}
+
+void req_respond(api_request *r, int status) {
+    req_respond_now(r, status, false);
+}
+
+void req_respond_empty(api_request *r, int status) {
+    req_respond_now(r, status, true);
 }
 
 void req_fail(api_request *r, int status, const char *message) {

@@ -27,6 +27,7 @@ typedef struct pg_pending {
     int limit;
     long long offset;
     const char *key;
+    unsigned char list_kind;    // PG_LIST_* branch of the merged list statement
     struct pg_pending *next;
 } pg_pending;
 
@@ -124,6 +125,7 @@ typedef struct pg_conn {
 
 struct pg_pool {
     loop *loop;
+    int worker_id;              // owning srv_worker; render jobs post back here
     int wx;                     // scheduler slot index
     int read_conns;
     int write_conns;
@@ -200,6 +202,11 @@ void pg_sched_read_live_inc(void);
 void pg_sched_read_live_dec(void);
 int  pg_read_batch_cap(pg_read_kind kind);
 void pg_pending_free(pg_pending *p);
+
+/* run a pending's callback on the offload pool: takes one reference on hold
+ * (reads) and ownership of raw (writes, cleared after cb); p is freed after cb */
+void pg_render_async(pg_pending *p, pg_status status, pg_result view,
+                     pg_batch_hold *hold, PGresult *raw);
 int64_t pg_mono_ms(void);
 
 #endif

@@ -6,7 +6,7 @@
 static void profile_loaded(void *ctx, pg_status status,
                            const pg_result *res) {
     api_request *r = ctx;
-    if (!req_release(r) || r->dead) return;
+    if (r->dead) return;
 
     if (status == PG_ROWS && pg_result_rows(res) >= 1) {
         profile_view view;
@@ -24,16 +24,14 @@ void handle_profile_get(api_request *r) {
         .viewer = r->viewer,
         .key = r->seg[0],
     };
-    req_hold(r);
-    pg_read_submit(r->worker->pg, PG_READ_PROFILE, &read, r, profile_loaded);
+    api_pg_read(r, PG_READ_PROFILE, &read, r, profile_loaded);
 }
 
 static void follow_begin(api_request *r, bool follow) {
     const char *params[2] = { req_ll(r, r->viewer), r->seg[0] };
-    req_hold(r);
-    pg_submit(r->worker->pg,
-              follow ? PG_STMT_FOLLOWS_INSERT : PG_STMT_FOLLOWS_DELETE,
-              2, params, r, profile_loaded);
+    api_pg_write(r,
+                 follow ? PG_STMT_FOLLOWS_INSERT : PG_STMT_FOLLOWS_DELETE,
+                 2, params, r, profile_loaded);
 }
 
 void handle_profile_follow(api_request *r) {
