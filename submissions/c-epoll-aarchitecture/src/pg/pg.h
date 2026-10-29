@@ -42,8 +42,10 @@ void pg_pool_tick(pg_pool *pool);
 void pg_submit(pg_pool *pool, pg_stmt stmt, int nparams,
                const char *const *params, void *ctx, pg_cb cb);
 
-/* batched read: a free read conn takes the oldest ready kind, up to the batch
- * limit, as one execution */
+/* batched read: the request joins the process-wide shared read queue; the
+ * first free read conn of any worker takes the oldest ready kind, up to the
+ * batch limit, as one execution — and the answer still runs back on this
+ * worker's loop */
 void pg_read_submit(pg_pool *pool, pg_read_kind kind, const pg_read *read,
                     void *ctx, pg_cb cb);
 

@@ -52,7 +52,16 @@ int main(void) {
 
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (cores < 1) cores = NPROC_FALLBACK;
-    int nworkers = env_positive("WORKERS", WORKERS_DEFAULT);
+
+    /* adaptive default: a shared read scheduler keeps every core busy without
+     * one lucky worker, so scale with core count (clamped 2..4: top entries
+     * use 2-4 and more conns cost more than they earn) */
+    int default_workers = (int)cores / 2;
+    if (default_workers < WORKERS_DEFAULT_MIN)
+        default_workers = WORKERS_DEFAULT_MIN;
+    if (default_workers > WORKERS_DEFAULT_MAX)
+        default_workers = WORKERS_DEFAULT_MAX;
+    int nworkers = env_positive("WORKERS", default_workers);
     if (nworkers > WORKERS_MAX) nworkers = WORKERS_MAX;
 
     /* pool budget is process-wide: workers * per stays under pg's connection

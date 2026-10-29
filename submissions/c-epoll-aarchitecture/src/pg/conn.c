@@ -14,6 +14,9 @@ static void pg_conn_consume(pg_conn *cn);
 static void pg_conn_deliver_group(pg_conn *cn);
 static void pg_conn_deliver_one(pg_conn *cn, PGresult *r);
 static void pg_conn_deliver_read(pg_conn *cn, PGresult *r);
+static void pg_owner_bag_add(pg_owner *bag, int *nbags, pg_pending *p,
+                             pg_remote_item *it);
+static void pg_owner_bag_flush(pg_owner *bag, int nbags);
 static void setup_fail(pg_conn *cn, const char *what);
 static void setup_connected(pg_conn *cn);
 static void setup_poll(pg_conn *cn);
@@ -188,44 +191,27 @@ void pg_conn_pump(pg_conn *cn) {
     pg_conn_set_events(cn);
 }
 
-void pg_conn_dispatch_read(pg_conn *cn) {
-    if (cn->dead || cn->busy || cn->role != PG_CONN_READ) return;
+bool pg_conn_dispatch_read(pg_conn *cn) {
+    if (cn->dead || cn->busy || cn->role != PG_CONN_READ) return false;
 
-    pg_pool *pool = cn->pool;
-    pg_read_kind best = PG_READ_COUNT;
-    uint64_t best_seq = UINT64_MAX;
-    for (int i = 0; i < PG_READ_COUNT; i++) {
-        pg_read_queue *q = &pool->queues[i];
-        if (q->head && q->head->seq < best_seq) {
-            best_seq = q->head->seq;
-            best = (pg_read_kind)i;
-        }
-    }
-    if (best == PG_READ_COUNT) return;
+    /* the pool has a free read conn: pull the oldest ready kind, up to the
+     * batch cap, from the process-wide shared queue */
+    pg_read_kind kind;
+    pg_pending **reqs;
+    int n;
+    if (!pg_sched_take(cn->pool, &kind, &reqs, &n)) return false;
 
-    pg_read_queue *q = &pool->queues[best];
-    int cap = pg_read_batch_cap(pool, best);
-    int n = q->count < cap ? q->count : cap;
-    pg_pending **reqs = xmalloc((size_t)n * sizeof *reqs);
-    for (int i = 0; i < n; i++) {
-        reqs[i] = q->head;
-        q->head = reqs[i]->next;
-        if (!q->head) q->tail = NULL;
-        reqs[i]->next = NULL;
-        q->count--;
-    }
-    pool->queued_reads -= n;
-
-    cn->batch.kind = best;
+    cn->batch.kind = kind;
     cn->batch.n = n;
     cn->batch.reqs = reqs;
     cn->busy = true;
 
-    if (!send_read(cn, best, reqs, n)) {
+    if (!send_read(cn, kind, reqs, n)) {
         pg_conn_fail(cn);
-        return;
+        return true;
     }
     pg_conn_set_events(cn);
+    return true;
 }
 
 void pg_conn_open(pg_conn *cn, const char *url, int index) {
@@ -270,6 +256,8 @@ void pg_conn_open(pg_conn *cn, const char *url, int index) {
     CHECK(fd >= 0, "pg[%d]: no socket", index);
     cn->ev = loop_add(cn->pool->loop, fd, LOOP_IN, pg_conn_event, cn);
     CHECK(cn->ev != NULL, "pg[%d]: loop_add failed", index);
+
+    if (cn->role == PG_CONN_READ) pg_sched_read_live_inc();
 }
 
 static void pg_conn_set_events(pg_conn *cn) {
@@ -311,8 +299,8 @@ static void pg_conn_fail(pg_conn *cn) {
     cn->busy = false;
 
     pg_pending *list = NULL;
-    pg_pending *tail = NULL;
     if (cn->batch.reqs) {
+        pg_pending *tail = NULL;
         for (int i = 0; i < cn->batch.n; i++) {
             pg_pending *p = cn->batch.reqs[i];
             p->next = NULL;
@@ -329,19 +317,42 @@ static void pg_conn_fail(pg_conn *cn) {
     cn->head = cn->tail = NULL;
     cn->queued = 0;
     if (queued) {
-        if (tail) tail->next = queued;
-        else list = queued;
+        if (list) {
+            pg_pending *tail = list;
+            while (tail->next) tail = tail->next;
+            tail->next = queued;
+        } else {
+            list = queued;
+        }
     }
+
+    /* batch pendings come from every pool (they were taken from the shared
+     * queue): fail each one on its own home's loop */
+    pg_owner bag[PG_SCHED_MAX_WORKERS];
+    memset(bag, 0, sizeof bag);
+    int nbags = 0;
+    while (list) {
+        pg_pending *p = list;
+        list = p->next;
+        p->next = NULL;
+        CHECK(p->home != NULL, "pg: pending has no home pool");
+        pg_remote_item *it = xcalloc(1, sizeof *it);
+        it->p = p;
+        it->status = PG_ERROR;
+        pg_owner_bag_add(bag, &nbags, p, it);
+    }
+    pg_owner_bag_flush(bag, nbags);
 
     if (cn->raw) {
         PQfinish(cn->raw);
         cn->raw = NULL;
     }
-    if (list) pg_pool_defer_failure(pool, list);
 
     if (cn->role == PG_CONN_READ) {
-        if (pool->read_live == 0) pg_pool_fail_queued_reads(pool);
-        else pg_pool_dispatch_reads(pool);
+        /* last read conn process-wide also fails everything parked in the
+         * shared queues */
+        pg_sched_read_live_dec();
+        pg_pool_dispatch_reads(pool);
     }
 }
 
@@ -384,12 +395,33 @@ static void pg_conn_deliver_group(pg_conn *cn) {
     cn->group_failed = false;
 }
 
+static void pg_owner_bag_add(pg_owner *bag, int *nbags, pg_pending *p,
+                             pg_remote_item *it) {
+    int b = 0;
+    for (; b < *nbags && bag[b].home != p->home; b++) {}
+    if (b == *nbags) {
+        CHECK(*nbags < PG_SCHED_MAX_WORKERS, "pg: too many worker groups");
+        bag[b].home = p->home;
+        (*nbags)++;
+    }
+    it->next = NULL;
+    if (bag[b].tail) bag[b].tail->next = it;
+    else bag[b].head = it;
+    bag[b].tail = it;
+}
+
+static void pg_owner_bag_flush(pg_owner *bag, int nbags) {
+    for (int b = 0; b < nbags; b++)
+        pg_remote_post(bag[b].home, bag[b].head, bag[b].tail);
+}
+
 static void pg_conn_deliver_read(pg_conn *cn, PGresult *r) {
     int n = cn->batch.n;
     pg_pending **reqs = cn->batch.reqs;
     pg_read_kind kind = cn->batch.kind;
     cn->batch.n = 0;
     cn->batch.reqs = NULL;
+    cn->batch.hold = NULL;
 
     bool broadcast = kind == PG_READ_TAGS;
     bool ok = r && PQresultStatus(r) == PGRES_TUPLES_OK;
@@ -441,30 +473,74 @@ static void pg_conn_deliver_read(pg_conn *cn, PGresult *r) {
                 (int)kind);
     }
 
+    /* the batch result outlives this conn: remote homes take one reference
+     * each and the last release clears it, on whichever thread got there
+     * first. so no PQclear here for reads */
+    pg_batch_hold *hold = NULL;
+    if (r) {
+        hold = xcalloc(1, sizeof *hold);
+        hold->raw = r;
+        __atomic_store_n(&hold->refs, 1, __ATOMIC_SEQ_CST);
+    }
+
+    /* pendings homed elsewhere get one inbox item each, posted per owner so
+     * the remote loop wakes once */
+    pg_owner bag[PG_SCHED_MAX_WORKERS];
+    memset(bag, 0, sizeof bag);
+    int nbags = 0;
+
     for (int i = 0; i < n; i++) {
         pg_pending *p = reqs[i];
-        if (!valid) {
-            pg_result view = { .raw = r };
-            p->cb(p->ctx, PG_ERROR, &view);
-        } else if (broadcast) {
-            pg_result view = {
-                .raw = r,
-                .first_row = 0,
-                .rows = PQntuples(r),
-                .col_offset = 0,
-            };
-            p->cb(p->ctx, PG_ROWS, &view);
-        } else {
-            pg_result view = {
-                .raw = r,
-                .first_row = first && count[i] ? first[i] : 0,
-                .rows = count ? count[i] : 0,
-                .col_offset = 1,
-            };
-            p->cb(p->ctx, PG_ROWS, &view);
+        if (p->home == cn->pool) {
+            if (!valid) {
+                pg_result view = { .raw = r };
+                p->cb(p->ctx, PG_ERROR, &view);
+            } else if (broadcast) {
+                pg_result view = {
+                    .raw = r,
+                    .first_row = 0,
+                    .rows = PQntuples(r),
+                    .col_offset = 0,
+                };
+                p->cb(p->ctx, PG_ROWS, &view);
+            } else {
+                pg_result view = {
+                    .raw = r,
+                    .first_row = first && count[i] ? first[i] : 0,
+                    .rows = count ? count[i] : 0,
+                    .col_offset = 1,
+                };
+                p->cb(p->ctx, PG_ROWS, &view);
+            }
+            pg_pending_free(p);
+            continue;
         }
-        pg_pending_free(p);
+
+        CHECK(p->home != NULL, "pg: pending has no home pool");
+        pg_remote_item *it = xcalloc(1, sizeof *it);
+        it->p = p;
+        it->status = !valid ? PG_ERROR : PG_ROWS;
+        if (r) {
+            it->view.raw = r;
+            if (valid && !broadcast) {
+                it->view.first_row = first && count[i] ? first[i] : 0;
+                it->view.rows = count ? count[i] : 0;
+                it->view.col_offset = 1;
+            } else if (valid) {
+                it->view.first_row = 0;
+                it->view.rows = PQntuples(r);
+                it->view.col_offset = 0;
+            }
+            it->viewp = &it->view;
+        }
+        if (r) {
+            __atomic_fetch_add(&hold->refs, 1, __ATOMIC_SEQ_CST);
+            it->hold = hold;
+        }
+        pg_owner_bag_add(bag, &nbags, p, it);
     }
+    pg_owner_bag_flush(bag, nbags);
+    if (hold) pg_hold_release(hold);
 
     free(first);
     free(count);
@@ -477,8 +553,9 @@ static void pg_conn_consume_read(pg_conn *cn) {
     if (PQisBusy(cn->raw)) return;
 
     PGresult *r = PQgetResult(cn->raw);
+    /* deliver_read owns the result: the shared batch hold clears it once the
+     * last remote home is done, so no PQclear here */
     pg_conn_deliver_read(cn, r);
-    if (r) PQclear(r);
 
     /* a query ends with a NULL result; drain it before the next execution */
     PGresult *end = PQgetResult(cn->raw);
@@ -648,6 +725,7 @@ static void setup_ready(pg_conn *cn) {
 
     if (cn->role == PG_CONN_READ) {
         pool->read_live++;
+        pg_sched_read_live_inc();
         pg_pool_dispatch_reads(pool);
     } else {
         pool->write_live++;

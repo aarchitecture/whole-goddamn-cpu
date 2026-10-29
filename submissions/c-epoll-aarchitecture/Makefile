@@ -6,14 +6,6 @@ CFLAGS  := $(WARN) -O2 -pthread -D_GNU_SOURCE -MMD -MP -Isrc $(PGINC)
 LDFLAGS :=
 LDLIBS  := -lpq -lssl -lcrypto -lcrypt
 
-# not for benchmarks lol
-SAN ?= 0
-ifeq ($(SAN),1)
-CFLAGS  := $(WARN) -O1 -g -fsanitize=address,undefined \
-           -fno-omit-frame-pointer -pthread -D_GNU_SOURCE -MMD -MP -Isrc $(PGINC)
-LDFLAGS := -fsanitize=address,undefined
-endif
-
 SRC  := $(shell find src -name '*.c' | sort)
 OBJ  := $(SRC:.c=.o)
 TEST_SRC := $(filter-out src/main.c,$(SRC))

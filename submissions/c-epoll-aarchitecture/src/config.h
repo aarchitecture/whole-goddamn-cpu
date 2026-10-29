@@ -7,8 +7,9 @@
 #define DEFAULT_HOST                "0.0.0.0"
 #define DEFAULT_PORT                "3000"
 #define NPROC_FALLBACK              4
-#define WORKERS_DEFAULT             2       // large read batches; top entries use 2-4
-#define WORKERS_MAX                 256
+#define WORKERS_DEFAULT_MIN         2
+#define WORKERS_DEFAULT_MAX         4       // adaptive default: clamp(cores/2)
+#define WORKERS_MAX                 32      // = pg's shared scheduler slot count
 
 #define LISTEN_BACKLOG              4096
 #define ACCEPT_BURST                128     // accepts per loop turn
@@ -38,8 +39,8 @@
 #define PG_CONNS_PER_WORKER         4       // one write + three reads
 #define PG_CONNS_MAX_TOTAL          90      // SPEC: <= 95 process-wide
 #define PG_WRITE_CONNS_PER_WORKER   1
-#define PG_READ_BATCH               64      // requests per batched read
-#define PG_READ_WINDOW_MS           20      // let a batch accumulate
+#define PG_READ_BATCH               512     // requests per shared batched read
+#define PG_READ_WINDOW_MS           0       // 0: dispatch as soon as a conn frees
 #define PG_READ_TAG_BATCH           1024    // tags broadcast may cover every waiter
 #define PG_WRITE_GROUP              32      // writes sharing one transaction
 #define PG_WRITE_GROUP_MAX          64

@@ -1,6 +1,7 @@
 #include "core/loop.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -16,6 +17,9 @@ struct loop_fd {
     void *user;
     struct loop *owner;
     struct loop_fd *next;
+    struct loop_fd *znext;
+    bool removed;               // pending free; a current epoll batch may still
+                                // hold events for this fd
 };
 
 struct loop {
@@ -25,6 +29,7 @@ struct loop {
     loop_timer_fn *timer_fn;
     void *timer_user;
     loop_fd *sources;
+    loop_fd *zombie;            // removed source structs, freed after the batch
 };
 
 static uint32_t epoll_mask(unsigned events) {
@@ -50,6 +55,11 @@ void loop_destroy(loop *l) {
         loop_fd *next = e->next;
         free(e);
         e = next;
+    }
+    while (l->zombie) {
+        loop_fd *next = l->zombie->znext;
+        free(l->zombie);
+        l->zombie = next;
     }
     if (l->timer_fd >= 0) close(l->timer_fd);
     close(l->ep);
@@ -79,7 +89,7 @@ loop_fd *loop_add(loop *l, int fd, unsigned events, loop_fd_fn *fn, void *user) 
 }
 
 void loop_set_events(loop *l, loop_fd *e, unsigned events) {
-    if (!e || e->events == events) return;
+    if (!e || e->removed || e->events == events) return;
     struct epoll_event ev;
     memset(&ev, 0, sizeof ev);
     ev.events = epoll_mask(events);
@@ -89,13 +99,22 @@ void loop_set_events(loop *l, loop_fd *e, unsigned events) {
     e->events = events;
 }
 
+/* A removed fd's data.ptr may still sit later in the epoll_wait batch that is
+ * running, so the struct is not freed here: removal only marks it and moves it
+ * onto the zombie list, which loop_run drains after the batch has been
+ * dispatched. Idempotent, since a caller may reach it twice. */
 void loop_remove(loop *l, loop_fd *e) {
-    if (!e) return;
+    if (!e || e->removed) return;
     epoll_ctl(l->ep, EPOLL_CTL_DEL, e->fd, NULL);
     loop_fd **at = &l->sources;
     while (*at && *at != e) at = &(*at)->next;
     if (*at) *at = e->next;
-    free(e);
+    e->removed = true;
+    e->fn = NULL;
+    e->user = NULL;
+    e->fd = -1;
+    e->znext = l->zombie;
+    l->zombie = e;
 }
 
 static void timer_event(void *user, loop_fd *self, unsigned events) {
@@ -139,10 +158,20 @@ void loop_run(loop *l, int timeout_ms) {
     }
     for (int i = 0; i < n; i++) {
         loop_fd *e = ready[i].data.ptr;
+        if (e->removed) continue;   // a callback freed it earlier this batch
         unsigned events = 0;
         if (ready[i].events & EPOLLIN) events |= LOOP_IN;
         if (ready[i].events & EPOLLOUT) events |= LOOP_OUT;
         if (ready[i].events & (EPOLLERR | EPOLLHUP)) events |= LOOP_ERR;
         if (events) e->fn(e->user, e, events);
+    }
+    /* deferred removals are drained here: nothing is freed while the ready
+     * array of this batch is still being walked */
+    loop_fd *z = l->zombie;
+    l->zombie = NULL;
+    while (z) {
+        loop_fd *next = z->znext;
+        free(z);
+        z = next;
     }
 }
