@@ -1,0 +1,8 @@
+bin/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+core

@@ -1,0 +1,18 @@
+import {
+  "conduit/wasip3/pgcore" @pgcore,
+  "conduit/wasip3/platform" @platform,
+  "conduit/wasip3/async-core" @async-core,
+  "conduit/wasip3/interface/wasi/sockets/types" @sockets,
+  "conduit/wasip3/interface/wasi/sockets/ip-name-lookup" @name_lookup,
+  "conduit/wasip3/interface/wasi/clocks/monotonic-clock" @monotonic,
+  "moonbit-community/postgres/protocol" @proto,
+  "moonbit-community/postgres/protocol/message/frontend" @frontend,
+  "moonbit-community/postgres/protocol/message/backend" @backend,
+  "moonbit-community/postgres/protocol/authentication" @authentication,
+  "moonbitlang/core/buffer",
+  "moonbitlang/core/encoding/utf8" @utf8,
+  "moonbitlang/core/string" @string,
+}
+
+warnings = "-44"
+supported_targets = "wasm"

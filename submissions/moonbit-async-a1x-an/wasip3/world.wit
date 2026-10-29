@@ -1,0 +1,12 @@
+package conduit:server@0.1.0;
+world server {
+ import wasi:cli/environment@0.3.2;
+ import wasi:cli/stdout@0.3.2;
+ import wasi:cli/stderr@0.3.2;
+ include wasi:clocks/imports@0.3.2;
+ include wasi:random/imports@0.3.2;
+ import wasi:sockets/types@0.3.2;
+ import wasi:sockets/ip-name-lookup@0.3.2;
+ import wasi:http/types@0.3.2;
+ export wasi:http/handler@0.3.2;
+}

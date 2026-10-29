@@ -1,0 +1,8 @@
+import {
+  "conduit/wasip3/interface/wasi/cli/environment" @environment,
+  "conduit/wasip3/interface/wasi/random/random" @random,
+  "conduit/wasip3/interface/wasi/clocks/system-clock" @system_clock,
+}
+
+warnings = "-44"
+supported_targets = "wasm"

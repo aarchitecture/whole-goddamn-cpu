@@ -1,0 +1,32 @@
+import {
+  "moonbitlang/async",
+  "moonbitlang/async/socket",
+  "conduit/httpfacade" @http,
+  "moonbitlang/async/aqueue",
+  "moonbitlang/async/fs",
+  "moonbitlang/core/env",
+  "moonbitlang/core/buffer",
+  "moonbitlang/core/encoding/utf8",
+  "moonbitlang/core/json",
+  "conduit/pgcore" @client,
+  "conduit/nativepool" @pgpool,
+  "moonbitstack/mooncred/jwt",
+  "moonbitstack/mooncrypt/mac/hmac",
+  "moonbitstack/mooncrypt/hash/sha2",
+}
+
+import {
+  "hackwaly/bcrypt",
+} for "wbtest"
+
+pkgtype(kind: "executable")
+
+options(
+  link: {
+    "native": {
+      "cc-flags": "-fwrapv -fno-strict-aliasing -ffp-contract=off -O3",
+    },
+  },
+)
+
+supported_targets = "+native+wasm"

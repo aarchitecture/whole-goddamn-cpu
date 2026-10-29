@@ -1,0 +1,19 @@
+import {
+  "conduit/wasip3/async-core" @async-core,
+  "conduit/wasip3/interface/wasi/http/types" @types,
+  "conduit/wasip3/platform" @env,
+  "conduit/wasip3/pgcore" @client,
+  "conduit/wasip3/pgpool" @pgpool,
+  "conduit/wasip3/httpfacade" @http,
+  "moonbit-community/postgres/protocol" @proto,
+  "moonbit-community/postgres/protocol/types" @pgtypes,
+  "moonbitlang/core/encoding/utf8" @utf8,
+  "moonbitlang/core/json",
+  "moonbitlang/core/string" @string,
+  "moonbitstack/mooncred/jwt" @jwt,
+  "moonbitstack/mooncrypt/mac/hmac" @hmac,
+  "moonbitstack/mooncrypt/hash/sha2" @sha2,
+}
+
+warnings = "-44"
+supported_targets = "wasm"

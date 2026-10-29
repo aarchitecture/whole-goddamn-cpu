@@ -1,0 +1,12 @@
+import {
+  "conduit/pgcore" @client,
+  "moonbit-community/postgres/protocol" @proto,
+  "moonbitlang/async",
+  "moonbitlang/async/aqueue",
+  "moonbitlang/async/socket",
+  "moonbitlang/core/env",
+}
+
+pkgtype(kind: "library")
+
+supported_targets = "+native"

@@ -1,0 +1,13 @@
+import {
+  "conduit/wasip3/async-core" @async-core,
+  "conduit/wasip3/interface/wasi/http/types" @types,
+  "conduit/wasip3/pgcore" @client,
+  "conduit/wasip3/pgpool" @pgpool,
+  "conduit/wasip3/platform" @platform,
+  "moonbitlang/core/encoding/utf8" @utf8,
+  "moonbitlang/core/string" @string,
+  "moonbitlang/core/json",
+}
+
+warnings = "-44"
+supported_targets = "wasm"
